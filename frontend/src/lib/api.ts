@@ -1,4 +1,10 @@
+import i18n from "@/i18n";
 import { authHeaders, withAuthTicket } from "@/lib/apiAuth";
+import type {
+  OptionsChainResponse,
+  OptionsPayoffRequest,
+  OptionsPayoffResponse,
+} from "@/lib/options";
 
 const BASE = "";
 
@@ -12,8 +18,18 @@ export class ApiError extends Error {
   }
 }
 
-export const AUTH_REQUIRED_MESSAGE =
-  "Remote API access requires an API key. Add it in Settings, or run the backend on localhost for local-only use.";
+const AUTH_REQUIRED_MESSAGE_KEY = "agent.authRequired";
+
+function getAuthRequiredMessage(): string {
+  return i18n.t(AUTH_REQUIRED_MESSAGE_KEY as never);
+}
+
+// Keep the existing string export compatible with consumers while updating its
+// live ES-module binding whenever the active locale changes.
+export let AUTH_REQUIRED_MESSAGE = getAuthRequiredMessage();
+i18n.on("languageChanged", () => {
+  AUTH_REQUIRED_MESSAGE = getAuthRequiredMessage();
+});
 
 export function isAuthRequiredError(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 401 || error.status === 403);
@@ -46,14 +62,232 @@ export interface CorrelationRegimeResponse {
   };
 }
 
+export interface PortfolioPosition {
+  source_id?: string;
+  profile_id?: string;
+  source_label?: string;
+  broker: string;
+  symbol: string;
+  name: string;
+  asset_type: string;
+  market: string;
+  currency: string;
+  quantity: number;
+  cost_price?: number | null;
+  market_price?: number | null;
+  market_value_usd: number;
+  market_value_cny: number;
+  unrealized_pnl_usd?: number | null;
+  priced: boolean;
+  updated_at: string;
+  pricing_basis?: string;
+  price_error?: string;
+}
+
+export interface PortfolioConnectorCompatibility {
+  level: "native" | "contract_tested" | "experimental";
+  contract_version: number;
+  asset_scope: string;
+  note: string;
+}
+
+/**
+ * One portfolio source as of the last refresh.
+ *
+ * A source that could not be read has `status === "error"`, no totals, and
+ * contributes nothing to the snapshot totals; `last_success_at` (when present)
+ * is the timestamp of the last read that did succeed, and is only ever shown
+ * as history — never as a current valuation.
+ */
+export interface PortfolioAccount {
+  source_id?: string;
+  profile_id?: string;
+  label?: string;
+  broker: string;
+  status: "ok" | "error";
+  last_success_at?: string;
+  total_usd?: number | null;
+  total_cny?: number | null;
+  priced_value_usd?: number;
+  cash_usd?: number;
+  unpriced_or_other_usd?: number;
+  position_count?: number;
+  priced_position_count?: number;
+  unpriced_position_count?: number;
+  error_code?: string;
+  error?: string;
+  failure_kind?: "authorization" | "transient";
+  reconnect_required?: boolean;
+  auth?: {
+    method: string;
+    renewal: "automatic" | "session" | "provider_managed";
+    readonly: boolean;
+    detail: string;
+  };
+  portfolio_compatibility?: PortfolioConnectorCompatibility;
+}
+
+export interface PortfolioSnapshot {
+  snapshot_id: string;
+  created_at: string;
+  /** False whenever any enabled source did not reach `status === "ok"`. */
+  complete: boolean;
+  display_currency?: "USD" | "CNY";
+  totals: { usd: number; cny: number };
+  valuation?: {
+    priced_usd: number;
+    cash_usd: number;
+    unpriced_or_other_usd: number;
+    identified_coverage: number;
+  };
+  fx: { usd_cny: number; usd_hkd: number; fetched_at: string; stale: boolean };
+  accounts: PortfolioAccount[];
+  positions: PortfolioPosition[];
+  combined_holdings?: Array<{
+    symbol: string;
+    market_value_usd: number;
+    asset_type?: string;
+    brokers?: string[];
+    unrealized_pnl_usd?: number;
+  }>;
+  /** Backend-authored English notes; rendered verbatim, not translated. */
+  warnings: string[];
+}
+
+export interface PortfolioHistoryPoint {
+  id: string;
+  created_at: string;
+  complete: number;
+  total_usd: string;
+  total_cny: string;
+}
+
+export interface PortfolioRefreshState {
+  running: boolean;
+  current: string | null;
+  sources?: Record<string, { status: "idle" | "pending" | "refreshing" | "ok" | "error"; error?: string | null }>;
+  brokers?: Record<string, { status: "idle" | "pending" | "refreshing" | "ok" | "error"; error?: string | null }>;
+}
+
+export interface PortfolioReconnectState {
+  running: boolean;
+  source_id: string | null;
+  status: "idle" | "authorizing" | "authorized" | "error" | "timeout";
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface PortfolioSourceSettings {
+  connection_id: string;
+  label: string;
+  enabled: boolean;
+  order: number;
+  include_cash: boolean;
+}
+
+export interface PortfolioSettings {
+  display_currency: "USD" | "CNY";
+  sources: PortfolioSourceSettings[];
+}
+
+export interface PortfolioSourceCatalogItem {
+  id: string;
+  connection_id: string;
+  profile_id: string;
+  connector: string;
+  label: string;
+  environment: "paper" | "live";
+  transport: "local_tws" | "remote_mcp" | "broker_sdk" | "local_plugin";
+  capabilities: string[];
+  readonly: boolean;
+  notes: string;
+  selected: boolean;
+  source_id?: string | null;
+  supports_reconnect: boolean;
+  credential_fields: CredentialField[];
+  credential_status: Record<string, boolean>;
+  credentials_configured: boolean;
+  portfolio_compatibility: PortfolioConnectorCompatibility;
+}
+
+export interface CredentialField {
+  name: string;
+  label: string;
+  secret: boolean;
+  required: boolean;
+}
+
+export interface ConnectorOnboarding {
+  schema_version: number;
+  auth_type: string;
+  credential_fields: CredentialField[];
+  dependency: string | null;
+  install_command: string | null;
+  test_operation: string;
+  setup_hint: string;
+  secret_storage: "os_keyring" | null;
+}
+
+export interface LocalConnection {
+  id: string;
+  profile_id: string;
+  label: string;
+  connector: string;
+  environment: "paper" | "live";
+  transport: "local_tws" | "remote_mcp" | "broker_sdk" | "local_plugin";
+  readonly: boolean;
+  capabilities: string[];
+  supports_reconnect: boolean;
+  credential_fields: CredentialField[];
+  credential_status: Record<string, boolean>;
+  credentials_configured: boolean;
+  onboarding?: ConnectorOnboarding;
+  portfolio_compatibility: PortfolioConnectorCompatibility;
+}
+
+export interface ReadonlyConnectionProfile {
+  id: string;
+  connector: string;
+  label: string;
+  environment: "paper" | "live";
+  transport: "local_tws" | "remote_mcp" | "broker_sdk" | "local_plugin";
+  capabilities: string[];
+  readonly: boolean;
+  notes: string;
+  local_plugin: boolean;
+  credential_fields: CredentialField[];
+  onboarding?: ConnectorOnboarding;
+  supports_reconnect: boolean;
+  portfolio_compatibility: PortfolioConnectorCompatibility;
+  invalid_plugin?: boolean;
+  directory?: string;
+  error?: string;
+}
+
+export interface ConnectionsResponse {
+  status: string;
+  connections: LocalConnection[];
+  profiles: ReadonlyConnectionProfile[];
+  plugin_directory: string;
+}
+
+export interface PortfolioSettingsResponse {
+  status: string;
+  settings: PortfolioSettings;
+  catalog: PortfolioSourceCatalogItem[];
+}
+
 async function errorFromResponse(res: Response): Promise<ApiError> {
   let detail = `HTTP ${res.status}`;
   try {
     const body = await res.json();
-    detail = body.detail || body.message || detail;
+    // Options endpoints report errors under an `error` key
+    // ({status:"error", error} / {ok:false, error}) rather than detail/message.
+    detail = body.detail || body.message || body.error || detail;
   } catch { /* ignore */ }
   if (res.status === 401 || res.status === 403) {
-    detail = AUTH_REQUIRED_MESSAGE;
+    detail = getAuthRequiredMessage();
   }
   return new ApiError(detail, res.status);
 }
@@ -119,6 +353,47 @@ export const api = {
     request<CorrelationRegimeResponse>(
       `/correlation/regime?codes=${encodeURIComponent(codes)}&days=${encodeURIComponent(String(days))}`,
     ),
+  getPortfolio: () => request<{ status: string; snapshot: PortfolioSnapshot | null }>("/api/portfolio"),
+  refreshPortfolio: () => request<{ status: string; snapshot: PortfolioSnapshot }>("/api/portfolio/refresh", { method: "POST" }),
+  getPortfolioRefreshStatus: () => request<{ status: string; refresh: PortfolioRefreshState }>("/api/portfolio/refresh-status"),
+  reconnectPortfolioSource: (sourceId: string) =>
+    request<{ status: string; reconnect: PortfolioReconnectState }>(`/api/portfolio/sources/${encodeURIComponent(sourceId)}/reconnect`, { method: "POST" }),
+  getPortfolioReconnectStatus: () =>
+    request<{ status: string; reconnect: PortfolioReconnectState }>("/api/portfolio/reconnect-status"),
+  getPortfolioSettings: () => request<PortfolioSettingsResponse>("/api/portfolio/settings"),
+  updatePortfolioSettings: (settings: PortfolioSettings) =>
+    request<PortfolioSettingsResponse>("/api/portfolio/settings", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
+  getConnections: () => request<ConnectionsResponse>("/api/connections"),
+  createConnection: (payload: { id: string; profile_id: string; label: string }) =>
+    request<{ status: string; connection: LocalConnection }>("/api/connections", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  saveConnectionCredentials: (connectionId: string, values: Record<string, string>) =>
+    request<{ status: string; credential_status: Record<string, boolean> }>(
+      `/api/connections/${encodeURIComponent(connectionId)}/credentials`,
+      { method: "POST", body: JSON.stringify({ values }) },
+    ),
+  checkConnection: (connectionId: string) =>
+    request<{ status: string; connection_id: string; report: Record<string, unknown> }>(
+      `/api/connections/${encodeURIComponent(connectionId)}/check`,
+      { method: "POST" },
+    ),
+  deleteConnection: (connectionId: string) =>
+    request<{ status: string; deleted: string }>(
+      `/api/connections/${encodeURIComponent(connectionId)}`,
+      { method: "DELETE" },
+    ),
+  getPortfolioHistory: (limit = 180) =>
+    request<{ status: string; history: PortfolioHistoryPoint[] }>(`/api/portfolio/history?limit=${encodeURIComponent(String(limit))}`),
+  downloadPortfolioCsv: async () => {
+    const response = await fetch(`${BASE}/api/portfolio/export.csv`, { headers: authHeaders() });
+    if (!response.ok) throw await errorFromResponse(response);
+    return response.blob();
+  },
   listRuns: (limit?: number) => request<RunListItem[]>(`/runs${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`),
   getRun: (id: string, params: RunDetailParams = {}) => {
     const q = new URLSearchParams();
@@ -128,11 +403,33 @@ export const api = {
     return request<RunData>(`/runs/${id}${qs ? `?${qs}` : ""}`);
   },
   getRunCode: (id: string) => request<Record<string, string>>(`/runs/${id}/code`),
+  getRunFactor: (id: string) => request<FactorReportPayload>(`/runs/${id}/factor`),
+  getRunAttribution: (id: string) => request<AttributionResponse>(`/runs/${encodeURIComponent(id)}/attribution`),
   getRunPine: (id: string) => request<PineScriptResult>(`/runs/${id}/pine`),
   listSessions: () => request<SessionItem[]>("/sessions"),
   createSession: (title?: string) => request<SessionItem>("/sessions", { method: "POST", body: JSON.stringify({ title: title || "" }) }),
   deleteSession: (sid: string) => request<{ status: string }>(`/sessions/${sid}`, { method: "DELETE" }),
   renameSession: (sid: string, title: string) => request<{ status: string }>(`/sessions/${sid}`, { method: "PATCH", body: JSON.stringify({ title }) }),
+  // Codex-style LLM summary title from the first exchange; backend refuses to
+  // overwrite a manual rename, so this is safe to fire-and-forget.
+  autoTitleSession: (sid: string) => request<{ status: string; title: string }>(`/sessions/${sid}/title/auto`, { method: "POST" }),
+  // Scheduled research: cadence + timezone are stored as authored (local
+  // wall-clock cron + IANA key), so list rows render without any UTC math.
+  listScheduledRuns: (signal?: AbortSignal) => request<ScheduledRun[]>("/scheduled-runs", { signal }),
+  createScheduledRun: (body: CreateScheduledRunRequest) =>
+    request<ScheduledRun>("/scheduled-runs", { method: "POST", body: JSON.stringify(body) }),
+  deleteScheduledRun: (id: string) =>
+    request<void>(`/scheduled-runs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  commitScheduledResearchProposal: (proposalId: string) =>
+    request<ScheduledResearchProposal>(
+      `/scheduled-runs/proposals/${encodeURIComponent(proposalId)}/commit`,
+      { method: "POST" },
+    ),
+  discardScheduledResearchProposal: (proposalId: string) =>
+    request<ScheduledResearchProposal>(
+      `/scheduled-runs/proposals/${encodeURIComponent(proposalId)}/discard`,
+      { method: "POST" },
+    ),
   sendMessage: (sid: string, content: string) => request<{ message_id: string; attempt_id: string }>(`/sessions/${sid}/messages`, { method: "POST", body: JSON.stringify({ content }) }),
   cancelSession: (sid: string) => request<{ status: string }>(`/sessions/${sid}/cancel`, { method: "POST" }),
   getSessionMessages: (sid: string) => request<MessageItem[]>(`/sessions/${sid}/messages`),
@@ -186,6 +483,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
+  listLLMModels: (settings: ListLLMModelsRequest) =>
+    request<LLMModelsResponse>("/settings/llm/models", {
+      method: "POST",
+      body: JSON.stringify(settings),
+    }),
   getDataSourceSettings: () => request<DataSourceSettings>("/settings/data-sources"),
   updateDataSourceSettings: (settings: UpdateDataSourceSettingsRequest) =>
     request<DataSourceSettings>("/settings/data-sources", {
@@ -200,7 +502,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-
   // Alpha Zoo API
   listAlphas: (params: AlphaListParams = {}) => {
     const q = new URLSearchParams();
@@ -228,6 +529,19 @@ export const api = {
   alphaCompareStreamUrl: (jobId: string) =>
     withAuthTicket(`${BASE}/alpha/compare/${encodeURIComponent(jobId)}/stream`),
 
+  // Options Lab
+  analyzeOptionsPayoff: (body: OptionsPayoffRequest) =>
+    request<OptionsPayoffResponse>("/options/payoff", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  getOptionsChain: (ticker: string, expiration?: number) => {
+    const q = new URLSearchParams();
+    q.set("ticker", ticker);
+    if (expiration !== undefined) q.set("expiration", String(expiration));
+    return request<OptionsChainResponse>(`/options/chain?${q.toString()}`);
+  },
+
   // Connector runtime channel — privileged surface actions (NOT agent tools).
   // commit is the ONLY action that writes a mandate; halt trips the kill switch.
   commitMandate: (body: CommitMandateRequest) =>
@@ -239,6 +553,11 @@ export const api = {
     request<HaltLiveResponse>("/live/halt", {
       method: "POST",
       body: JSON.stringify({ session_id, broker, reason }),
+    }),
+  resumeLive: (session_id?: string, broker?: string) =>
+    request<HaltLiveResponse>("/live/resume", {
+      method: "POST",
+      body: JSON.stringify({ session_id, broker }),
     }),
   // Read the persistent runtime status across all authorized brokers (SPEC §7.5).
   // Polled by the RunnerStatus panel; a plain authenticated GET, never a chat message.
@@ -264,6 +583,99 @@ export const api = {
       body: JSON.stringify({ broker }),
     }),
 };
+
+// --- Scheduled research types ---
+
+export interface VerdictItem {
+  symbol: string;
+  state: string;
+  reason: string;
+}
+
+export interface VerdictRecord {
+  session_id: string;
+  recorded_at: number;
+  parse: string;
+  outcome: string;
+  items: VerdictItem[];
+  previous: VerdictRecord | null;
+}
+
+export interface ScheduledRun {
+  id: string;
+  prompt: string;
+  title: string;
+  source_type: "prompt" | "playbook";
+  playbook_slug: string | null;
+  end_at: number | null;
+  schedule: string;
+  next_run_at: number;
+  status: string;
+  created_at: number;
+  last_run_at: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
+  failure_kind: string | null;
+  config: Record<string, unknown>;
+  timezone: string | null;
+  // Delivery is opt-in per monitor: a null channel means results stay in the
+  // app, which is what every monitor created before this did.
+  delivery_channel: string | null;
+  delivery_target: string | null;
+  delivery_target_ref: string | null;
+  delivery_target_label: string | null;
+  delivery_status: string;
+  delivery_error: string | null;
+  delivery_updated_at: number | null;
+  delivery_attempts: number;
+  delivery_provider_message_id: string | null;
+  // The latest run's parsed verdict, embedded with its predecessor so the list
+  // renders a delta in one query. Null until a completed run records one.
+  last_verdict: VerdictRecord | null;
+}
+
+export interface CreateScheduledRunRequest {
+  id?: string;
+  title?: string | null;
+  prompt: string;
+  schedule: string;
+  timezone?: string | null;
+  end_at?: number | null;
+  config?: Record<string, unknown>;
+  delivery_channel?: string | null;
+  delivery_target?: string | null;
+  delivery_target_ref?: string | null;
+}
+
+export interface ScheduledResearchProposalJob {
+  id: string;
+  title: string;
+  state: string;
+  source: { kind: string; playbook_slug?: string | null; prompt?: string | null };
+  schedule: {
+    expression: string;
+    timezone: string | null;
+    next_run_at: number | null;
+    end_at: number | null;
+  };
+  delivery: {
+    channel: string | null;
+    target_ref: string | null;
+    target_label: string | null;
+    status: string;
+  };
+}
+
+export interface ScheduledResearchProposal {
+  type: "scheduled_research.proposal";
+  proposal_id: string;
+  operation: "create" | "cancel";
+  status: "pending" | "committed" | "discarded" | "expired";
+  expires_at: number;
+  job: ScheduledResearchProposalJob;
+  job_id?: string | null;
+  committed_job_id?: string | null;
+}
 
 // --- Swarm types ---
 
@@ -326,6 +738,38 @@ export interface UpdateLLMSettingsRequest {
   reasoning_effort?: string;
 }
 
+export interface ListLLMModelsRequest {
+  provider: string;
+  base_url?: string;
+  api_key?: string;
+}
+
+export interface LLMModelsResponse {
+  provider: string;
+  models: string[];
+  source: "provider" | "default";
+  warning_code?:
+    | "oauth_discovery_unsupported"
+    | "api_key_required"
+    | "model_list_unavailable"
+    | null;
+}
+
+export interface SourceOrderEntry {
+  market: string;
+  env_var: string;
+  default_order: string[];
+  effective_order: string[];
+  override?: string[] | null;
+  override_invalid: boolean;
+}
+
+export interface SourceOrderUpdate {
+  market: string;
+  /** New order (permutation of default_order). null/omitted = reset to default. */
+  order?: string[] | null;
+}
+
 export interface DataSourceSettings {
   tushare_token_configured: boolean;
   tushare_token_hint?: string | null;
@@ -333,11 +777,13 @@ export interface DataSourceSettings {
   baostock_installed: boolean;
   baostock_message: string;
   env_path: string;
+  source_orders?: SourceOrderEntry[];
 }
 
 export interface UpdateDataSourceSettingsRequest {
   tushare_token?: string;
   clear_tushare_token?: boolean;
+  source_orders?: SourceOrderUpdate[];
 }
 
 export interface ChannelAdapterStatus {
@@ -421,6 +867,19 @@ export interface EquityPoint {
   drawdown: string | number;
 }
 
+/** Monte Carlo fan-chart payload: percentile envelope + sampled paths over trade order. */
+export interface MonteCarloEquityPaths {
+  steps: number[];
+  initial_capital: number;
+  actual: number[];
+  band_p5: number[];
+  band_p25: number[];
+  band_p50: number[];
+  band_p75: number[];
+  band_p95: number[];
+  samples: number[][];
+}
+
 export interface ValidationData {
   monte_carlo?: {
     actual_sharpe: number;
@@ -433,6 +892,8 @@ export interface ValidationData {
     simulated_sharpe_p95: number;
     n_simulations: number;
     n_trades: number;
+    sharpe_samples?: number[];
+    equity_paths?: MonteCarloEquityPaths;
     error?: string;
   };
   bootstrap?: {
@@ -443,6 +904,7 @@ export interface ValidationData {
     prob_positive: number;
     confidence: number;
     n_bootstrap: number;
+    sharpe_samples?: number[];
     error?: string;
   };
   walk_forward?: {
@@ -467,6 +929,142 @@ export interface ValidationData {
   };
 }
 
+export interface RiskXRayPayload {
+  inputs?: {
+    symbols?: string[];
+    weights?: Record<string, number>;
+    aligned_days?: number;
+    return_observations?: number;
+    first_date?: string;
+    last_date?: string;
+  };
+  concentration?: { hhi?: number; effective_n?: number; top_weight?: number };
+  volatility?: { annualized_vol?: number };
+  drawdown?: { max_drawdown?: number };
+  tail_risk?: Record<string, unknown>;
+  diversification?: Record<string, unknown>;
+  correlation?: Record<string, unknown>;
+  skipped?: string[];
+  warnings?: string[];
+}
+
+export interface RebalanceNotesPayload {
+  rebalances?: Array<{
+    date: string;
+    turnover: number;
+    entries?: Array<{ code: string; to: number }>;
+    exits?: Array<{ code: string; from: number }>;
+    top_moves?: Array<{ code: string; from: number; to: number; delta: number }>;
+  }>;
+  summary?: {
+    target_change_count: number;
+    /** Legacy key on runs produced before the #1275 execution-evidence fix. */
+    rebalance_count?: number;
+    turnover_total: number;
+    turnover_mean: number;
+    turnover_max: number;
+    largest_rebalance_date?: string | null;
+    rebalance_executed_bars?: number;
+    rebalance_executed_fills?: number;
+    rebalance_realized_turnover?: number;
+  };
+}
+
+export interface FactorIcStats {
+  ic_mean?: number | null;
+  ic_std?: number | null;
+  ir?: number | null;
+  ic_positive_ratio?: number | null;
+  ic_count?: number | null;
+  [key: string]: unknown;
+}
+
+export interface FactorResult {
+  name: string;
+  path: string;
+  ic_series: Array<{ date: string; ic: number }>;
+  ic_stats?: FactorIcStats;
+  group_equity: Array<{ date: string } & Record<string, number | string>>;
+  n_groups: number;
+  long_short_spread: number | null;
+  group_final_equity: Record<string, number>;
+  truncated?: {
+    ic_series?: boolean;
+    ic_stats?: boolean;
+    group_equity?: boolean;
+  };
+}
+
+export interface FactorReportPayload {
+  exists: boolean;
+  factors: FactorResult[];
+  ic_correlation: { labels: string[]; matrix: number[][] } | null;
+}
+
+// --- Attribution types (GET /runs/{runId}/attribution) ---
+
+export interface AttributionBenchmarkInfo {
+  ticker: string | null;
+  mode: "auto_equal_weight" | "explicit";
+}
+
+export interface AttributionRollingPoint {
+  date: string;
+  beta: number;
+  alpha_annualized: number;
+}
+
+export interface AttributionCumulativePoint {
+  date: string;
+  portfolio: number;
+  benchmark: number;
+  /** Portfolio-minus-benchmark cumulative return; plotted as the active line. */
+  active: number;
+}
+
+export interface AttributionFactor {
+  beta: number;
+  alpha_per_period: number;
+  alpha_annualized: number;
+  alpha_t_stat: number;
+  r_squared: number;
+  n_obs: number;
+  rolling_window: number;
+  rolling: AttributionRollingPoint[] | null;
+  cumulative: AttributionCumulativePoint[];
+}
+
+export interface AttributionSectorEntry {
+  sector: string;
+  portfolio_weight: number;
+  benchmark_weight: number;
+  portfolio_return: number;
+  benchmark_return: number;
+  allocation: number;
+  selection: number;
+  interaction: number;
+  total: number;
+}
+
+export interface AttributionBrinson {
+  mode: "symbol" | "asset_class" | "invested_cash";
+  portfolio_return: number;
+  benchmark_return: number;
+  active_return: number;
+  allocation: number;
+  selection: number;
+  interaction: number;
+  sectors: AttributionSectorEntry[];
+}
+
+export interface AttributionResponse {
+  exists: boolean;
+  benchmark: AttributionBenchmarkInfo | null;
+  factor: AttributionFactor | null;
+  brinson: AttributionBrinson | null;
+  notes: string[];
+}
+
 export interface RunData {
   status: string;
   run_id: string;
@@ -479,7 +1077,10 @@ export interface RunData {
   metrics?: BacktestMetrics;
   artifacts?: ArtifactInfo[];
   run_card?: RunCard;
+  risk_xray?: RiskXRayPayload;
+  rebalance_notes?: RebalanceNotesPayload;
   validation?: ValidationData;
+  has_factor_artifacts?: boolean;
 
   chart_symbols?: string[];
   price_series?: Record<string, PriceBar[]>;
@@ -487,7 +1088,62 @@ export interface RunData {
   trade_markers?: TradeMarker[];
   equity_curve?: EquityPoint[];
   trade_log?: Array<Record<string, string>>;
+  /** Full equity.csv rows (timestamp/equity/drawdown as strings); not capped like equity_curve. */
+  artifacts_equity_csv?: Array<Record<string, string>>;
+  artifacts_metrics_csv?: Array<Record<string, string>>;
+  artifacts_trades_csv?: Array<Record<string, string>>;
+  /** Filled portfolio weights per date (rows: {timestamp, <symbol>: weight-string}). */
+  artifacts_positions_csv?: Array<Record<string, string>>;
+  /** Requested target weights per date, same row shape as artifacts_positions_csv. */
+  artifacts_target_positions_csv?: Array<Record<string, string>>;
   run_logs?: Array<{ source?: string; line_number?: number; message?: string }>;
+}
+
+// --- Positions sector-map types (GET /runs/{runId}/positions/sectors) ---
+
+/** Asset classes reported by the backend sector-map endpoint. */
+export type SectorAssetClass =
+  | "a_share"
+  | "us_equity"
+  | "hk_equity"
+  | "india_equity"
+  | "kr_equity"
+  | "ca_equity"
+  | "crypto"
+  | "futures"
+  | "forex";
+
+export interface SectorInfo {
+  asset_class: SectorAssetClass;
+  /** Resolved industry name, or null when unresolved / not applicable. */
+  industry: string | null;
+  /** Provenance of `industry` (e.g. "eastmoney"), null when unresolved. */
+  industry_source: string | null;
+}
+
+export interface SectorMapResponse {
+  ok: boolean;
+  run_id?: string;
+  resolved_at?: string;
+  cached?: boolean;
+  symbols: Record<string, SectorInfo>;
+  unresolved?: string[];
+  /** Total symbol columns in positions.csv (may exceed `symbol_limit`). */
+  total_symbols?: number;
+  /** Max symbols that receive a network industry lookup per resolve. */
+  symbol_limit?: number;
+  /** Present when the run has no positions artifact. */
+  note?: string;
+}
+
+/**
+ * Fetch the resolved sector map for one run's positions artifact.
+ * Uses the same auth-header + error-envelope conventions as every other
+ * fetcher in this module (via the shared `request` helper).
+ */
+export function fetchRunSectorMap(runId: string, refresh?: boolean): Promise<SectorMapResponse> {
+  const qs = refresh ? "?refresh=1" : "";
+  return request<SectorMapResponse>(`/runs/${encodeURIComponent(runId)}/positions/sectors${qs}`);
 }
 
 export interface RunCard {
@@ -1044,4 +1700,15 @@ export interface MessageItem {
   created_at: string;
   linked_attempt_id?: string;
   metadata?: Record<string, unknown>;
+  tool_trail?: ToolTrailItem[];
+}
+
+export interface ToolTrailItem {
+  tool: string;
+  status: "running" | "ok" | "error";
+  arguments?: Record<string, string>;
+  elapsed_ms?: number;
+  preview?: string;
+  call_id?: string;
+  timestamp?: number;
 }

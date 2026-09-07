@@ -10,6 +10,7 @@ Covers:
 - Thread safety
 - _parse_bool utility
 - get_env_or utility
+- get_env_value utility
 - _parse_env_bool (EnvBool BeforeValidator)
 """
 
@@ -23,6 +24,7 @@ from src.config.accessor import (
     _parse_bool,
     get_env_config,
     get_env_or,
+    get_env_value,
     reset_env_config,
 )
 from src.config.env_schema import (
@@ -73,11 +75,33 @@ class TestEnvConfigDefaults:
         assert c.llm.langchain_model_name == ""
         assert c.llm.langchain_temperature == 0.0
         assert c.llm.timeout_seconds == 120
+        assert c.llm.vibe_trading_disable_http_proxy is False
         assert c.llm.max_retries == 2
         assert c.llm.langchain_reasoning_effort == ""
+        assert c.llm.langchain_use_responses_api is None
         assert c.llm.vibe_trading_deepseek_adapter == "auto"
         assert c.llm.moonshot_user_agent == ""
         assert c.llm.openai_codex_base_url == "https://chatgpt.com/backend-api/codex/responses"
+
+    def test_llm_responses_api_reads_boolean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", "true")
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is True
+
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", "false")
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is False
+
+    @pytest.mark.parametrize("value", ["TRUE", "yes", "1", "on"])
+    def test_llm_responses_api_requires_literal_true(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("LANGCHAIN_USE_RESPONSES_API", value)
+        reset_env_config()
+
+        assert EnvConfig().llm.langchain_use_responses_api is False
 
     def test_data_defaults(self) -> None:
         c = EnvConfig()
@@ -100,6 +124,13 @@ class TestEnvConfigDefaults:
         assert c.data.longbridge_app_key == ""
         assert c.data.longbridge_app_secret == ""
         assert c.data.longbridge_access_token == ""
+        # Per-market source-order overrides default to unset (default chains).
+        for market in (
+            "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
+            "ca_equity", "vietnam_equity", "crypto", "futures", "fund",
+            "macro", "forex", "index",
+        ):
+            assert getattr(c.data, f"market_data_order_{market}") == ""
 
     def test_api_defaults(self) -> None:
         c = EnvConfig()
@@ -122,6 +153,8 @@ class TestEnvConfigDefaults:
         assert c.swarm.swarm_timeout == 1800
         assert c.swarm.swarm_heartbeat_interval_s == 3.0
         assert c.swarm.swarm_stream_retry_delay_s == 1.0
+        assert c.swarm.swarm_worker_retry_base_delay_s == 1.0
+        assert c.swarm.swarm_worker_retry_max_delay_s == 30.0
         assert c.swarm.swarm_grounding_max_symbols == 8
 
     def test_agent_tuning_defaults(self) -> None:
@@ -136,6 +169,10 @@ class TestEnvConfigDefaults:
         assert c.agent_tuning.content_filter_warning_threshold == 0.05
         assert c.agent_tuning.vibe_trading_enable_advisory is False
         assert c.agent_tuning.vibe_trading_enable_scheduler is False
+        assert c.agent_tuning.vibe_contextual_identity_constraints is True
+        assert c.agent_tuning.vibe_trading_scheduler_max_consecutive_failures == 3
+        assert c.agent_tuning.vibe_trading_scheduler_retry_base_delay_ms == 60_000
+        assert c.agent_tuning.vibe_trading_scheduler_retry_max_delay_ms == 3_600_000
         assert c.agent_tuning.vibe_trading_channels_auto_start is False
         assert c.agent_tuning.vibe_trading_disable_bottleneck is False
         assert c.agent_tuning.vibe_trading_bench_workers == 0
@@ -194,6 +231,24 @@ class TestEnvConfigTypeCoercion:
         monkeypatch.setenv("SWARM_HEARTBEAT_INTERVAL_S", "5.5")
         c = EnvConfig()
         assert c.swarm.swarm_heartbeat_interval_s == 5.5
+
+    def test_scheduler_retry_int_coercion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VIBE_TRADING_SCHEDULER_MAX_CONSECUTIVE_FAILURES", "5")
+        monkeypatch.setenv("VIBE_TRADING_SCHEDULER_RETRY_BASE_DELAY_MS", "2500")
+        monkeypatch.setenv("VIBE_TRADING_SCHEDULER_RETRY_MAX_DELAY_MS", "10000")
+
+        tuning = EnvConfig().agent_tuning
+
+        assert tuning.vibe_trading_scheduler_max_consecutive_failures == 5
+        assert tuning.vibe_trading_scheduler_retry_base_delay_ms == 2500
+        assert tuning.vibe_trading_scheduler_retry_max_delay_ms == 10000
+
+    def test_contextual_identity_constraints_can_be_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VIBE_CONTEXTUAL_IDENTITY_CONSTRAINTS", "false")
+
+        assert EnvConfig().agent_tuning.vibe_contextual_identity_constraints is False
 
 
 # ===================================================================
@@ -457,6 +512,20 @@ class TestGetEnvOr:
         monkeypatch.setenv("PRIMARY", "")
         monkeypatch.setenv("FALLBACK", "")
         assert get_env_or("PRIMARY", "FALLBACK", "default") == "default"
+
+
+class TestGetEnvValue:
+    """Verify dynamic registry keys still go through the config layer."""
+
+    def test_reads_configured_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DYNAMIC_PROVIDER_API_KEY", "secret")
+        assert get_env_value("DYNAMIC_PROVIDER_API_KEY") == "secret"
+
+    def test_returns_default_for_missing_value(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("DYNAMIC_PROVIDER_API_KEY", raising=False)
+        assert get_env_value("DYNAMIC_PROVIDER_API_KEY", "fallback") == "fallback"
 
 
 # ===================================================================

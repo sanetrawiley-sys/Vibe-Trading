@@ -297,7 +297,7 @@ def benford_check(values: list[Any]) -> dict[str, Any]:
     digits: list[int] = []
     for raw in values:
         v = abs(float(raw))
-        if v > 0:
+        if v > 0 and math.isfinite(v):
             sig = 10 ** (math.log10(v) - math.floor(math.log10(v)))
             d = int(sig)
             if 1 <= d <= 9:
@@ -512,6 +512,7 @@ class FinancialRigorTool(BaseTool):
         "required": ["command"],
     }
     is_readonly = True
+    deterministic = True  # pure computation; identical args -> identical result
     repeatable = True  # loop.py dedups non-repeatable tools by name; users call
                        # different sub-commands / params in one session.
 

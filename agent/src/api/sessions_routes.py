@@ -5,6 +5,7 @@ Mounted by ``agent/api_server.py`` via ``register_sessions_routes(app)``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -14,6 +15,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+from src.session.events import SSEEvent
+from src.session.service import SessionBusyError
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ class MessageResponse(BaseModel):
     created_at: str
     linked_attempt_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    tool_trail: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class CreateGoalRequest(BaseModel):
@@ -184,6 +189,10 @@ def _get_goal_store():
 
 _PROPOSAL_TOOL_NAME = "propose_mandate_profiles"
 _PROPOSAL_ID_RE = re.compile(r'"proposal_id"\s*:\s*"(mp_[0-9a-f]{32})"')
+_SCHEDULED_PROPOSAL_TOOL_NAME = "scheduled_research"
+_SCHEDULED_PROPOSAL_ID_RE = re.compile(
+    r'"proposal_id"\s*:\s*"(srp_[0-9a-f]{32})"'
+)
 
 
 def _load_full_proposal(proposal_id: str) -> Optional[Dict[str, Any]]:
@@ -225,6 +234,32 @@ def _mandate_proposal_frame_from_tool_result(event: Any) -> Optional[str]:
         session_id=getattr(event, "session_id", "") or "",
     )
     return frame.to_sse()
+
+
+def _scheduled_proposal_frame_from_tool_result(event: Any) -> Optional[str]:
+    """Build a deterministic scheduled-research confirmation SSE frame."""
+    data = getattr(event, "data", None)
+    if getattr(event, "event_type", None) != "tool_result" or not isinstance(data, dict):
+        return None
+    if data.get("tool") != _SCHEDULED_PROPOSAL_TOOL_NAME or data.get("status") != "ok":
+        return None
+    match = _SCHEDULED_PROPOSAL_ID_RE.search(str(data.get("preview") or ""))
+    if not match:
+        return None
+    try:
+        from src.scheduled_research.proposals import load_proposal
+
+        proposal = load_proposal(match.group(1))
+    except Exception:  # pragma: no cover - relay must never break the stream
+        logger.debug("scheduled proposal reload failed", exc_info=True)
+        return None
+    from src.session.events import SSEEvent
+
+    return SSEEvent(
+        event_type="scheduled_research.proposal",
+        data=proposal,
+        session_id=getattr(event, "session_id", "") or "",
+    ).to_sse()
 
 
 _LIVE_ACTION_ID_RE = re.compile(r'"audit_id"\s*:\s*"(la_[0-9a-zA-Z]+)"')
@@ -328,13 +363,26 @@ def register_sessions_routes(app: FastAPI) -> None:
     # Session CRUD routes
     # -----------------------------------------------------------------------
 
-    @app.post("/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_auth)])
-    async def create_session(request: CreateSessionRequest):
-        """Create a chat session."""
+    @app.post("/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+    async def create_session(
+        request: CreateSessionRequest,
+        principal=Depends(require_auth),
+    ):
+        """Create a chat session.
+
+        The authenticated principal is recorded as the session owner. Under the
+        shared-key and loopback auth modes that principal is not attributable to
+        a named human -- it carries ``attributable=False`` and must not be read
+        as an identity. Recording it anyway is still worth doing: it captures
+        HOW the session was authorised, which is the part that becomes an
+        identity once an identity provider is wired in.
+        """
         svc = _host_get_session_service()
         if not svc:
             raise HTTPException(status_code=501, detail="Session runtime not enabled")
-        session = svc.create_session(title=request.title, config=request.config)
+        session = svc.create_session(
+            title=request.title, config=request.config, owner=principal
+        )
         return SessionResponse(
             session_id=session.session_id,
             title=session.title,
@@ -614,6 +662,73 @@ def register_sessions_routes(app: FastAPI) -> None:
         svc.store.update_session(session)
         return {"status": "updated", "session_id": session_id}
 
+    @app.post("/sessions/{session_id}/title/auto", dependencies=[Depends(require_auth)])
+    async def auto_title_session(session_id: str):
+        """Summarize the first exchange into a short LLM-generated title.
+
+        Never clobbers a manual rename: only rewrites when the current title
+        is empty or still the auto-set first-prompt prefix from create time.
+        """
+        _host_validate_path_param(session_id, "session_id")
+        svc = _host_get_session_service()
+        if not svc:
+            raise HTTPException(status_code=501, detail="Session runtime not enabled")
+        session = svc.store.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+        messages = svc.get_messages(session_id, limit=6)
+        first_user = next(
+            (m for m in messages if m.role == "user" and (m.content or "").strip()), None
+        )
+        if first_user is None:
+            raise HTTPException(status_code=409, detail="Session has no user message to summarize")
+
+        current = (session.title or "").strip()
+        auto_prefix = first_user.content.strip()[:50].strip()
+        if current and current != auto_prefix:
+            return {"status": "kept", "session_id": session_id, "title": current}
+
+        first_assistant = next(
+            (m for m in messages if m.role == "assistant" and (m.content or "").strip()), None
+        )
+        excerpt = f"User: {first_user.content.strip()[:600]}"
+        if first_assistant:
+            excerpt += f"\nAssistant: {first_assistant.content.strip()[:600]}"
+        prompt = (
+            "Write a session title for the conversation below: at most 8 words "
+            "(or 16 CJK characters), in the same language as the user's message, "
+            "no quotes, no trailing punctuation. Reply with the title only.\n\n"
+            + excerpt
+        )
+
+        def _generate() -> str:
+            from src.providers.chat import ChatLLM
+
+            llm = ChatLLM()
+            try:
+                response = llm.chat([{"role": "user", "content": prompt}], timeout=30)
+                return (getattr(response, "content", "") or "").strip()
+            finally:
+                llm.close()
+
+        try:
+            raw = await asyncio.to_thread(_generate)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"title generation failed: {exc}")
+
+        title = raw.splitlines()[0].strip().strip("\"'“”「」『』").strip() if raw else ""
+        chars = list(title)
+        if len(chars) > 40:
+            title = "".join(chars[:40])
+        if not title:
+            raise HTTPException(status_code=502, detail="empty title from model")
+
+        session.title = title
+        session.updated_at = datetime.now(timezone.utc).isoformat()
+        svc.store.update_session(session)
+        return {"status": "updated", "session_id": session_id, "title": title}
+
     @app.post("/sessions/{session_id}/messages", dependencies=[Depends(require_auth)])
     async def send_message(session_id: str, payload: SendMessageRequest, http_request: Request):
         """Send a user message and start the agent loop (natural language strategy)."""
@@ -628,6 +743,10 @@ def register_sessions_routes(app: FastAPI) -> None:
                 include_shell_tools=_host_shell_tools_enabled_for_request(http_request),
             )
             return result
+        except SessionBusyError as exc:
+            # Must precede ValueError-style handling and stay distinct from 404:
+            # the session exists, it is simply already running.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
@@ -660,6 +779,7 @@ def register_sessions_routes(app: FastAPI) -> None:
                 created_at=m.created_at,
                 linked_attempt_id=m.linked_attempt_id,
                 metadata=m.metadata if m.metadata else None,
+                tool_trail=m.tool_trail,
             )
             for m in messages
         ]
@@ -684,12 +804,31 @@ def register_sessions_routes(app: FastAPI) -> None:
         event_id = header_id or last_event_id
         replay_active = (replay or "").lower() == "active"
         replay_all = False
+        running_attempt = None
         if replay_active and not event_id and session.last_attempt_id:
             attempt = svc.store.get_attempt(session_id, session.last_attempt_id)
             attempt_status = getattr(attempt.status, "value", attempt.status) if attempt else None
             replay_all = attempt_status == "running"
+            if replay_all:
+                running_attempt = attempt
 
         async def event_generator():
+            # The ring buffer is bounded, so a long attempt's original
+            # `attempt.started` may already have rotated out by the time a client
+            # joins. Re-announce it from the persisted attempt so the client's
+            # elapsed clock starts from the real start, not from now. Clients
+            # treat a repeated attempt.started for the same attempt as a no-op.
+            if running_attempt is not None and running_attempt.started_at:
+                yield SSEEvent(
+                    event_id=None,
+                    event_type="attempt.started",
+                    data={
+                        "attempt_id": running_attempt.attempt_id,
+                        "started_at": running_attempt.started_at,
+                        "replayed": True,
+                    },
+                    session_id=session_id,
+                ).to_sse()
             async for event in svc.event_bus.subscribe(
                 session_id,
                 last_event_id=event_id,
@@ -701,6 +840,9 @@ def register_sessions_routes(app: FastAPI) -> None:
                 relayed = _mandate_proposal_frame_from_tool_result(event)
                 if relayed is not None:
                     yield relayed
+                scheduled_relay = _scheduled_proposal_frame_from_tool_result(event)
+                if scheduled_relay is not None:
+                    yield scheduled_relay
                 live_action = _live_action_frame_from_tool_result(event)
                 if live_action is not None:
                     yield live_action

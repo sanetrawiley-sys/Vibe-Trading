@@ -251,6 +251,47 @@ def test_loader_cache_disabled_by_default_bypasses_home(tmp_path, monkeypatch):
     assert not (home / ".vibe-trading").exists()
 
 
+def test_stubbed_config_cannot_enable_cache_or_redirect_root_into_cwd(monkeypatch, tmp_path):
+    """A MagicMock config must not switch the cache on or escape the home root.
+
+    A bare ``MagicMock`` reads truthy and its ``__fspath__`` returns a
+    *relative* string, so an unguarded implementation both enabled the opt-in
+    cache and resolved its root against the CWD — writing market data inside
+    the working tree, which the project forbids.
+    """
+    from unittest.mock import MagicMock
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    stub = MagicMock()
+    monkeypatch.setattr(
+        "src.config.accessor.get_env_config", lambda: stub, raising=False
+    )
+
+    assert base.loader_cache_enabled() is False
+
+    root = base.loader_cache_root()
+    assert root.is_absolute()
+    assert root == home / ".vibe-trading" / "cache" / "loaders"
+
+
+def test_loader_cache_root_honors_real_string_override(monkeypatch, tmp_path):
+    """A genuine string override is still respected."""
+    stub = SimpleNamespace(
+        data=SimpleNamespace(
+            vibe_trading_data_cache=True,
+            vibe_trading_data_cache_root=str(tmp_path / "custom"),
+        )
+    )
+    monkeypatch.setattr(
+        "src.config.accessor.get_env_config", lambda: stub, raising=False
+    )
+
+    assert base.loader_cache_enabled() is True
+    assert base.loader_cache_root() == tmp_path / "custom"
+
+
 def test_loader_cache_key_partitions_source_symbol_timeframe_date_and_fields():
     base_args = {
         "source": "tushare",
@@ -279,6 +320,10 @@ def test_loader_cache_happy_path_writes_then_reuses(
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     calls = {"count": 0}
     frame = _cache_frame()
+    frame.attrs.update(
+        quote_currency="GBP",
+        currency_conversion="GBp→GBP (÷100)",
+    )
 
     def fetch():
         calls["count"] += 1
@@ -298,6 +343,7 @@ def test_loader_cache_happy_path_writes_then_reuses(
     assert calls["count"] == 1
     pd.testing.assert_frame_equal(first, frame)
     pd.testing.assert_frame_equal(second, frame)
+    assert second.attrs == frame.attrs
     assert loader_cache_path(**kwargs).is_file()
     assert str(loader_cache_path(**kwargs)).startswith(str(loader_cache_root))
 
@@ -428,6 +474,10 @@ def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch, loader_cache
     pytest.importorskip("duckdb")
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     frame = _cache_frame()
+    frame.attrs.update(
+        quote_currency="GBP",
+        currency_conversion="GBp→GBP (÷100)",
+    )
     kwargs = {
         "source": "yfinance",
         "symbol": "AAPL.US",
@@ -447,6 +497,7 @@ def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch, loader_cache
     # The cache preserves columns name and per-level index dtype, so a real
     # duckdb round-trip is byte-identical to the source frame.
     pd.testing.assert_frame_equal(restored, frame)
+    assert restored.attrs == frame.attrs
 
 
 def test_yfinance_loader_serves_second_fetch_from_cache(tmp_path, monkeypatch, fake_duckdb, loader_cache_root):

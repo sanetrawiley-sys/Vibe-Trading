@@ -62,6 +62,63 @@ class TestInferMarket:
         assert infer_market("830799.BJ") == "a_share"
         assert infer_market("AAPL.US") == "us_equity"
         assert infer_market("9988.HK") == "hk_equity"
+        assert infer_market("TD.TO") == "ca_equity"
+        assert infer_market("PNG.V") == "ca_equity"
+
+    def test_precious_metals_classify_as_forex(self):
+        # Bare 6-letter precious-metal symbols are spot / OTC markets. The
+        # underlying asset is XAU / XAG / XPT / XPD (ISO 4217 metals); the
+        # quote is USD. Engines (ForexEngine._METAL_SPECS) already handle the
+        # correct pip / lot conventions; the classifier just has to land on
+        # ``forex`` so the forex fallback chain (mt5, tickerall, qveris,
+        # yfinance) is engaged instead of the a_share chain.
+        assert infer_market("XAUUSD") == "forex"
+        assert infer_market("XAGUSD") == "forex"
+        assert infer_market("XPTUSD") == "forex"
+        assert infer_market("XPDUSD") == "forex"
+
+    def test_g10_fx_pairs_classify_as_forex(self):
+        # G10 currency pairs in their bare 6-letter form. Same routing as
+        # metals above: bare code, no separator, must reach the forex chain.
+        assert infer_market("EURUSD") == "forex"
+        assert infer_market("GBPUSD") == "forex"
+        assert infer_market("USDJPY") == "forex"
+        assert infer_market("USDCHF") == "forex"
+        assert infer_market("AUDUSD") == "forex"
+        assert infer_market("NZDUSD") == "forex"
+        assert infer_market("USDCAD") == "forex"
+
+    def test_yahoo_equals_notation_routes_to_underlying_market(self):
+        # Yahoo's continuous-front-month futures form ``=F`` and forex form
+        # ``=X`` must reach the underlying market's chain instead of falling
+        # through to the a_share default.
+        assert infer_market("GC=F") == "futures"   # COMEX Gold
+        assert infer_market("CL=F") == "futures"   # NYMEX Crude
+        assert infer_market("SI=F") == "futures"   # COMEX Silver
+        assert infer_market("HG=F") == "futures"   # COMEX Copper
+        assert infer_market("MGC=F") == "futures"  # Micro Gold
+        assert infer_market("XAUUSD=X") == "forex"
+        assert infer_market("EURUSD=X") == "forex"
+
+    def test_6char_metals_whitelist_does_not_over_match_us_equities(self):
+        # A bare 6-letter US ticker that happens to start with a 3-letter
+        # word NOT in the metals/G10 whitelist must not be re-routed. The
+        # whitelist's whole point is to be conservative; length-only patterns
+        # were rejected for this reason.
+        assert infer_market("NFLXLI") != "forex"  # not a real ticker, but illustrative
+        assert infer_market("AMZNLY") != "forex"
+        # GLD (3 letters) is gold ETF, not a metal pair; stays us_equity.
+        assert infer_market("GLD") == "us_equity"
+        # Tokenized gold is crypto, not metal forex.
+        assert infer_market("XAUT-USDT") == "crypto"
+        assert infer_market("PAXG-USDT") == "crypto"
+
+    def test_btcusdt_style_joined_pairs_stay_crypto(self):
+        # A bare joined crypto pair must still classify as crypto. This
+        # guards the new whitelist against over-aggressive skipping.
+        assert infer_market("BTCUSDT") == "crypto"
+        assert infer_market("ETHUSDT") == "crypto"
+        assert infer_market("SOLUSDT") == "crypto"
 
 
 class TestNormalizeSymbol:
@@ -81,6 +138,7 @@ class TestNormalizeSymbol:
         assert _normalize_symbol("AAPL.US", "us_equity") == "AAPL.US"
         assert _normalize_symbol("600000.SH", "a_share") == "600000.SH"
         assert _normalize_symbol("0700.HK", "hk_equity") == "0700.HK"
+        assert _normalize_symbol("TD.TO", "ca_equity") == "TD.TO"
 
     def test_crypto_passes_through(self):
         assert _normalize_symbol("BTC-USDT", "crypto") == "BTC-USDT"
@@ -230,6 +288,23 @@ class TestRollingCorrelationMatrix:
         # Both should be reasonable correlations
         assert -1 <= p_matrix[0][1] <= 1
         assert -1 <= s_matrix[0][1] <= 1
+
+    def test_does_not_forward_fill_missing_closes(self):
+        # Under pandas>=2,<3 a bare pct_change() forward-fills NaN closes,
+        # manufacturing a 0% return on the halted session and pairing it
+        # against the peer's real move. GAP tracks PEER exactly, so once the
+        # halted session is dropped instead of filled the two are perfectly
+        # correlated. Mirrors TestAlignedReturns in test_regime.py.
+        peer_closes = [100.0, 110.0, 115.5, 112.035, 121.0, 123.42]
+        gap_closes = [c / 2.0 for c in peer_closes]
+        gap_closes[2] = np.nan  # trading halt: no close printed
+        price_series = {
+            "GAP": self._make_price_df(gap_closes),
+            "PEER": self._make_price_df(peer_closes),
+        }
+        labels, matrix = _rolling_correlation_matrix(price_series, window=30, method="pearson")
+        i, j = labels.index("GAP"), labels.index("PEER")
+        assert matrix[i][j] == pytest.approx(1.0)
 
     def test_empty_dict_returns_empty(self):
         labels, matrix = _rolling_correlation_matrix({}, window=30, method="pearson")

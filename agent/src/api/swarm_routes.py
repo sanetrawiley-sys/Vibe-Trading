@@ -6,7 +6,6 @@ Mounted by ``agent/api_server.py`` via ``register_swarm_routes(app, ...)``.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -25,12 +24,10 @@ def _get_swarm_runtime():
     if _swarm_runtime is not None:
         return _swarm_runtime
     from src.config import load_swarm_agent_config
-    from src.swarm.store import SwarmStore
+    from src.swarm.store import SwarmStore, swarm_runs_root
     from src.swarm.runtime import SwarmRuntime
 
-    # Adjust path: this file is at agent/src/api/, so parent.parent.parent = agent/
-    swarm_dir = Path(__file__).resolve().parent.parent.parent / ".swarm" / "runs"
-    store = SwarmStore(base_dir=swarm_dir)
+    store = SwarmStore(base_dir=swarm_runs_root())
     # Boot-time / operator-trusted: REST API callers cannot influence the
     # config path. See docs/2026-05-25_swarm_mcp_tools_roadmap.md.
     agent_config = load_swarm_agent_config()
@@ -79,9 +76,14 @@ def register_swarm_routes(
 
     # --- Routes ---
 
-    @app.get("/swarm/presets")
+    @app.get("/swarm/presets", dependencies=[Depends(require_auth)])
     async def list_swarm_presets():
-        """List Swarm YAML presets."""
+        """List Swarm YAML presets.
+
+        Authenticated for the same reason as ``/skills``: the preset inventory
+        describes configured agent capabilities and should not be readable by a
+        peer that cannot start a swarm run.
+        """
         from src.swarm.presets import list_presets
 
         return list_presets()
@@ -219,10 +221,13 @@ def register_swarm_routes(
         return {"status": "cancelled"}
 
     @app.post("/swarm/runs/{run_id}/retry", dependencies=[Depends(require_auth)])
-    async def retry_swarm_run(run_id: str, http_request: Request):
+    async def retry_swarm_run(run_id: str, http_request: Request, resume: bool = Query(False)):
         """Retry a failed, stale, or cancelled swarm run.
 
         Creates a new run with the same preset and user_vars as the original.
+        ``resume=true`` replays: completed upstream tasks and their artifacts
+        are carried into the new run and only the failed/cancelled subgraph
+        re-executes.
         """
         _host_validate_path_param(run_id, "run_id")
         runtime = _get_swarm_runtime()
@@ -239,12 +244,21 @@ def register_swarm_routes(
             raise HTTPException(
                 status_code=409, detail="Cannot retry a running run. Cancel it first."
             )
+        if resume and reconciled.status not in (RunStatus.failed, RunStatus.cancelled):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot resume a run in status '{reconciled.status.value}'; "
+                    "resume only applies to failed or cancelled runs."
+                ),
+            )
 
         try:
             new_run = runtime.start_run(
                 reconciled.preset_name,
                 reconciled.user_vars or {},
                 include_shell_tools=_host_shell_tools_enabled_for_request(http_request),
+                resume_from=reconciled if resume else None,
             )
             return {
                 "id": new_run.id,

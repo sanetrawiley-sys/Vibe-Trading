@@ -74,7 +74,40 @@ from src.factors.registry import Registry, RegistryError
 # We treat ``<repo>`` (and any subdirectory thereof) as the write-allow root.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
+# Benchmarkable data universes: every name here must have a panel loader in
+# ``src.tools.alpha_bench_tool._UNIVERSE_TAG``. There is no KRX (or NSE/BSE)
+# panel yet, so Korea/India are deliberately absent — ``alpha bench`` would
+# fail at universe load, not produce a Korean benchmark.
 _UNIVERSE_CHOICES = ["csi300", "sp500", "btc-usdt"]
+
+# Per-row fields that only ``bench_runner_strict`` produces. They are the
+# statistics ``categorise_strict`` actually gates on, so a strict run that
+# omits them reports a verdict the reader cannot check. Forwarded to both the
+# JSON envelope and the HTML report when present.
+_STRICT_ROW_FIELDS = (
+    "alpha_t_full",
+    "alpha_t_train",
+    "alpha_t_test",
+    "random_ic_mean",
+)
+
+# Factor-metadata universes accepted by ``alpha list --universe`` — these are
+# the values carried in each alpha's ``universe`` metadata, which is what
+# ``Registry.list`` filters on. Keep in sync with
+# ``src.factors.registry.Universe`` and the REST allowlist in
+# ``src.api.alpha_routes._VALID_UNIVERSES``.
+_LIST_UNIVERSE_CHOICES = [
+    "equity_us", "equity_cn", "equity_hk", "equity_in", "equity_kr",
+    "crypto", "futures",
+]
+# Benchmark universe -> the metadata universe its panel represents, so
+# ``alpha list --universe csi300`` keeps working (it used to filter on a name no
+# alpha carries and silently listed nothing). Mirrors the REST alias map.
+_LIST_UNIVERSE_ALIASES = {
+    "csi300": "equity_cn",
+    "sp500": "equity_us",
+    "btc-usdt": "crypto",
+}
 
 
 def _print(msg: str) -> None:
@@ -145,7 +178,10 @@ def cmd_alpha_list(args: argparse.Namespace) -> int:
     """
     try:
         reg = Registry()
-        ids = reg.list(zoo=args.zoo, theme=args.theme, universe=args.universe)
+        universe = args.universe
+        if universe is not None:
+            universe = _LIST_UNIVERSE_ALIASES.get(universe, universe)
+        ids = reg.list(zoo=args.zoo, theme=args.theme, universe=universe)
 
         limit = getattr(args, "limit", None)
         total = len(ids)
@@ -641,7 +677,7 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
         # Normalise rows + skipped for the report template (and for the JSON
         # envelope so consumers don't see the internal _category key).
         def _normalise_row(r: dict[str, Any]) -> dict[str, Any]:
-            return {
+            normalised = {
                 "id": r.get("id"),
                 "zoo": r.get("zoo") or _zoo_for_id(reg, r.get("id")),
                 "theme": r.get("theme") or [],
@@ -653,6 +689,14 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
                 "ic_count": r.get("ic_count", 0),
                 "category": r.get("_category") or r.get("category"),
             }
+            # Strict mode decides on the alpha t-stats and the random-control
+            # baseline, none of which survived this projection — so a strict
+            # run reported a category with no way to see the numbers behind
+            # it. Forward them when present; non-strict rows are unchanged.
+            for key in _STRICT_ROW_FIELDS:
+                if key in r:
+                    normalised[key] = r[key]
+            return normalised
 
         def _normalise_skipped(s: dict[str, Any]) -> dict[str, Any]:
             return {"alpha_id": s.get("id") or s.get("alpha_id"), "reason": s.get("reason", "")}
@@ -687,6 +731,7 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
                 "n_skipped": len(skipped),
                 "top": top_rows,
                 "failures": failures_for_report,
+                "strict": bool(getattr(args, "strict", False)),
             }
             if universe_meta:
                 context["meta"] = universe_meta
@@ -905,8 +950,12 @@ def add_subparser(subparsers: Any) -> argparse.ArgumentParser:
     p_list.add_argument(
         "--universe",
         default=None,
-        choices=_UNIVERSE_CHOICES,
-        help=f"Filter by universe ({', '.join(_UNIVERSE_CHOICES)})",
+        choices=_LIST_UNIVERSE_CHOICES + _UNIVERSE_CHOICES,
+        help=(
+            "Filter by factor universe "
+            f"({', '.join(_LIST_UNIVERSE_CHOICES)}); the benchmark names "
+            f"({', '.join(_UNIVERSE_CHOICES)}) are accepted as aliases"
+        ),
     )
     p_list.add_argument(
         "--limit",

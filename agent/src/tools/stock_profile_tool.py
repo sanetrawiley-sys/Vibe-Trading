@@ -59,6 +59,10 @@ def _key_stats(module: Dict[str, Any]) -> Dict[str, Any]:
         module,
         (
             "enterpriseValue",
+            # EV multiples arrive in the same payload and were being dropped,
+            # leaving no capital-structure-neutral valuation measure at all.
+            "enterpriseToEbitda",
+            "enterpriseToRevenue",
             "forwardPE",
             "trailingEps",
             "forwardEps",
@@ -104,6 +108,11 @@ def _earnings_trend(module: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         eps = entry.get("earningsEstimate") or {}
         rev = entry.get("revenueEstimate") or {}
+        # The consensus level alone is a snapshot. Its trajectory and the
+        # up/down revision counts arrive in the same payload and are what
+        # estimate-revision momentum is actually built from.
+        trend = entry.get("epsTrend") or {}
+        revisions = entry.get("epsRevisions") or {}
         rows.append(
             {
                 "period": entry.get("period"),
@@ -114,6 +123,12 @@ def _earnings_trend(module: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "eps_high": _raw(eps.get("high")),
                 "eps_analysts": _raw(eps.get("numberOfAnalysts")),
                 "revenue_avg": _raw(rev.get("avg")),
+                "eps_trend_current": _raw(trend.get("current")),
+                "eps_trend_7d_ago": _raw(trend.get("7daysAgo")),
+                "eps_trend_30d_ago": _raw(trend.get("30daysAgo")),
+                "eps_trend_90d_ago": _raw(trend.get("90daysAgo")),
+                "eps_revisions_up_30d": _raw(revisions.get("upLast30days")),
+                "eps_revisions_down_30d": _raw(revisions.get("downLast30days")),
             }
         )
     return rows
@@ -212,7 +227,12 @@ def _resolve_sections(sections: Optional[List[str]]) -> List[str]:
 
 def _market_for(ticker: str) -> str:
     """Classify a ticker into a coarse market label for the envelope."""
-    return "hk" if ticker.strip().upper().endswith(".HK") else "us"
+    upper = ticker.strip().upper()
+    if upper.endswith(".HK"):
+        return "hk"
+    if upper.endswith(".L"):
+        return "uk"
+    return "us"
 
 
 class StockProfileTool(BaseTool):
@@ -220,12 +240,12 @@ class StockProfileTool(BaseTool):
 
     name = "get_stock_profile"
     description = (
-        "Fetch a read-only company profile for a US or Hong Kong listing from "
-        "Yahoo Finance: valuation key statistics, analyst price targets and "
-        "earnings/revenue estimates, institutional and insider ownership, and "
-        "the analyst recommendation trend. Use this for fundamentals and "
-        "consensus context, not for OHLCV price bars (use get_market_data). "
-        'Example: get_stock_profile(ticker="AAPL.US", '
+        "Fetch a read-only company profile for a US, Hong Kong, or UK (LSE .L) "
+        "listing from Yahoo Finance: valuation key statistics, analyst price "
+        "targets and earnings/revenue estimates, institutional and insider "
+        "ownership, and the analyst recommendation trend. Use this for "
+        "fundamentals and consensus context, not for OHLCV price bars (use "
+        "get_market_data). Example: get_stock_profile(ticker=\"AAPL.US\", "
         'sections=["key_stats", "financials"]).'
     )
     parameters = {
@@ -234,8 +254,9 @@ class StockProfileTool(BaseTool):
             "ticker": {
                 "type": "string",
                 "description": (
-                    "US or HK symbol. US uses a bare or .US suffix (AAPL or "
-                    "AAPL.US); HK uses a zero-padded .HK code (00700.HK)."
+                    "US, HK, or UK (LSE .L) symbol. US uses a bare or .US suffix "
+                    "(AAPL or AAPL.US); HK uses a zero-padded .HK code "
+                    "(00700.HK); UK uses the .L suffix (VOD.L)."
                 ),
             },
             "sections": {

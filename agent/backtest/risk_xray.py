@@ -18,11 +18,16 @@ Conventions:
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+
+from backtest.metrics import effective_bars_per_year
+from backtest.validation import _json_safe
 
 MIN_HISTORY_DAYS = 30
 PERIODS_PER_YEAR = 252
@@ -83,7 +88,7 @@ def compute_risk_xray(
     closes: pd.DataFrame,
     weights: Mapping[str, float],
     *,
-    periods_per_year: int = PERIODS_PER_YEAR,
+    periods_per_year: int | None = PERIODS_PER_YEAR,
     var_levels: Sequence[float] = VAR_LEVELS,
     min_history: int = MIN_HISTORY_DAYS,
 ) -> dict[str, Any]:
@@ -93,7 +98,9 @@ def compute_risk_xray(
         closes: Close-price panel, one column per symbol, sorted by date.
         weights: Symbol → weight. Renormalized to 1.0 with a warning when the
             sum differs; must be long-only and reference existing columns.
-        periods_per_year: Annualization factor for the bar interval.
+        periods_per_year: Annualization factor for the bar interval; ``None``
+            falls back to span-derived calendar annualization (mirrors
+            ``calc_metrics``) — the runner's cross-market convention.
         var_levels: Tail levels for historical VaR / expected shortfall.
         min_history: Minimum valid bars a symbol must have to be included.
 
@@ -132,6 +139,8 @@ def compute_risk_xray(
         # fully invested basket, and say so.
         kept_weights = {sym: weights[sym] for sym in kept}
         total = sum(kept_weights.values())
+        if total <= 0:
+            raise ValueError("surviving symbols have zero total weight")
         weights = {sym: value / total for sym, value in kept_weights.items()}
         warnings.append("weights renormalized over symbols that survived the history filter")
 
@@ -181,27 +190,47 @@ def _concentration(w: np.ndarray) -> dict[str, Any]:
     }
 
 
-def _volatility(port: pd.Series, ppy: int) -> dict[str, Any]:
+def _volatility(port: pd.Series, ppy: int | None) -> dict[str, Any]:
     vol = float(port.std(ddof=1)) if len(port) > 1 else None
     downside = port[port < 0]
     downside_dev = float(downside.std(ddof=1)) if len(downside) > 1 else None
+    annualize = _annualize_factor(ppy, port.index)
     return {
         "daily_vol": _finite(vol),
-        "annualized_vol": _finite(vol * math.sqrt(ppy)) if vol is not None else None,
+        "annualized_vol": _finite(vol * annualize) if vol is not None else None,
         "downside_deviation_annualized": (
-            _finite(downside_dev * math.sqrt(ppy)) if downside_dev is not None else None
+            _finite(downside_dev * annualize) if downside_dev is not None else None
         ),
     }
+
+
+def _annualize_factor(ppy: int | None, index: Any) -> float:
+    """Return the annualization factor ``sqrt(periods_per_year)``.
+
+    ``ppy is None`` means the caller deliberately declined to specify a
+    per-market bar count — the runner's cross-market convention
+    (``bars_per_year=None``). Resolving it through the shared
+    ``effective_bars_per_year`` is what keeps the x-ray's annualized
+    volatility on the same footing as the Sharpe in the same run card (a
+    fixed 365 would sit ~18% higher for a 252-trading-day daily series).
+    """
+    if ppy is not None:
+        return math.sqrt(float(ppy))
+    return math.sqrt(float(effective_bars_per_year(index)))
 
 
 def _drawdown(port: pd.Series) -> dict[str, Any]:
     if port.empty:
         return {"max_drawdown": None, "max_drawdown_start": None, "max_drawdown_trough": None}
     equity = (1.0 + port).cumprod()
-    peak = equity.cummax()
-    dd = equity / peak - 1.0
+    # The portfolio starts at wealth 1 before the first return observation.
+    # Keeping that initial high-water mark also preserves the drawdown sign
+    # after a sub -100% return sends compounded wealth through zero.
+    peak = equity.cummax().clip(lower=1.0)
+    dd = (equity - peak) / peak
     trough_idx = dd.idxmin()
-    start_idx = equity.loc[:trough_idx].idxmax()
+    pre_trough = equity.loc[:trough_idx]
+    start_idx = port.index[0] if float(pre_trough.max()) < 1.0 else pre_trough.idxmax()
     return {
         "max_drawdown": _finite(float(dd.loc[trough_idx])),
         "max_drawdown_start": str(start_idx),
@@ -275,3 +304,84 @@ def _correlation(returns: pd.DataFrame, port: pd.Series) -> dict[str, Any]:
         "max_pair": max_pair,
         "beta_to_equal_weight": _finite(beta),
     }
+
+
+def average_invested_weights(target_pos: pd.DataFrame) -> tuple[dict[str, float], float]:
+    """Derive the run's average basket from the target position frame.
+
+    Returns ``(weights, avg_invested)``: the mean target weight per symbol
+    restricted to symbols the strategy actually held on average, and the mean
+    row sum (how much of the book was invested at all). The final row alone
+    would be the wrong object here, since many strategies end flat.
+
+    Raises:
+        ValueError: when the frame is empty, the strategy never held
+            anything on average, or any symbol's average exposure is net
+            short — ``compute_risk_xray`` is long-only, and silently
+            x-raying just the long half of a long-short book would present
+            a partial basket as the whole strategy.
+    """
+    if target_pos is None or target_pos.empty:
+        raise ValueError("target position frame is empty")
+    means = target_pos.mean(axis=0)
+    short_book = [str(sym) for sym, w in means.items() if float(w) < 0]
+    if short_book:
+        raise ValueError(
+            "long-only x-ray cannot describe net short average exposure "
+            f"in {', '.join(short_book)}"
+        )
+    weights = {str(sym): float(w) for sym, w in means.items() if float(w) > 0}
+    avg_invested = float(target_pos.sum(axis=1).mean())
+    if not weights:
+        raise ValueError("strategy held no average exposure")
+    return weights, avg_invested
+
+
+def render_risk_xray_markdown(report: dict[str, Any]) -> str:
+    """Render an x-ray report as a compact Markdown summary."""
+    inputs = report["inputs"]
+    conc = report["concentration"]
+    vol = report["volatility"]
+    dd = report["drawdown"]
+    tail = report["tail_risk"]
+    lines = [
+        "# Portfolio Risk X-Ray",
+        "",
+        f"- basket: {', '.join(inputs['symbols'])}",
+        f"- window: {inputs['first_date']} .. {inputs['last_date']} "
+        f"({inputs['aligned_days']} aligned days)",
+    ]
+    if conc.get("hhi") is not None:
+        lines.append(
+            f"- concentration: hhi {conc['hhi']:.4f}, "
+            f"effective n {conc['effective_n']:.2f}, "
+            f"top1 {conc['top1_weight']:.2%}, top3 {conc['top3_weight']:.2%}"
+        )
+    if vol.get("annualized_vol") is not None:
+        lines.append(f"- annualized vol: {vol['annualized_vol']:.2%}")
+    if dd.get("max_drawdown") is not None:
+        lines.append(f"- max drawdown: {dd['max_drawdown']:.2%}")
+    if tail.get("var_95") is not None:
+        lines.append(
+            f"- tail (historical): VaR95 {tail['var_95']:.2%}, ES95 {tail['expected_shortfall_95']:.2%}"
+        )
+    if report["skipped"]:
+        joined = ", ".join(item["symbol"] for item in report["skipped"])
+        lines.append(f"- skipped: {joined}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_risk_xray(path: Path, report: dict[str, Any]) -> dict[str, Any]:
+    """Write the report to ``path`` as strict, RFC-8259 JSON.
+
+    Same contract as ``write_rebalance_notes``: sanitize with ``_json_safe``
+    and serialize with ``allow_nan=False``. Returns the sanitized payload.
+    """
+    safe_report = _json_safe(report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(safe_report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return safe_report

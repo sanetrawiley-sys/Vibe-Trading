@@ -25,13 +25,29 @@ from backtest.models import Position
 _MARKET_PATTERNS = [
     (re.compile(r"^\d{6}\.(SZ|SH|BJ)$", re.I), "a_share"),
     (re.compile(r"^(51|15|56)\d{4}\.(SZ|SH)$", re.I), "a_share"),
-    (re.compile(r"^[A-Z]+\.US$", re.I), "us_equity"),
+    # US equities: tickers may carry a class-share dot (BRK.B.US, BF.B.US)
+    # and a hyphen (e.g. BF-B.US) — same characters as ca/india/uk below.
+    (re.compile(r"^[A-Z0-9&.\-]+\.US$", re.I), "us_equity"),
     (re.compile(r"^\d{3,5}\.HK$", re.I), "hk_equity"),
     # India equities: NSE (RELIANCE.NS) / BSE (500325.BO); tickers may carry
     # '&' and '-' (e.g. M&M.NS, BAJAJ-AUTO.NS).
     (re.compile(r"^[A-Z0-9&.\-]+\.(NS|BO)$", re.I), "india_equity"),
+    # Korea equities: KOSPI (005930.KS) / KOSDAQ (247540.KQ), 6-digit codes.
+    (re.compile(r"^\d{6}\.(KS|KQ)$", re.I), "kr_equity"),
+    # Canada equities: Toronto Stock Exchange (TD.TO) and TSX Venture
+    # (PNG.V). Yahoo carries both suffixes verbatim.
+    (re.compile(r"^[A-Z0-9&.\-]+\.(TO|V)$", re.I), "ca_equity"),
+    # UK equities: London Stock Exchange (VOD.L, SHEL.L). Yahoo carries the
+    # suffix verbatim.
+    (re.compile(r"^[A-Z0-9&.\-]+\.L$", re.I), "uk_equity"),
+    # Vietnam equities: HOSE (VIC.VN). Tickers are three letters in practice;
+    # the class stays broad to admit fund certificates and ETF codes.
+    (re.compile(r"^[A-Z0-9]+\.VN$", re.I), "vietnam_equity"),
     (re.compile(r"^[A-Z]+-USDT$", re.I), "crypto"),
     (re.compile(r"^[A-Z]+/USDT$", re.I), "crypto"),
+    # yfinance's native crypto spelling (BTC-USD, ETH-USD). Distinct from
+    # USDT pairs only in the quote currency; both belong to CryptoEngine.
+    (re.compile(r"^[A-Z]+-USD$", re.I), "crypto"),
     # China futures: product+delivery.exchange (e.g. IF2406.CFFEX, rb2410.SHFE)
     (re.compile(r"^[A-Za-z]{1,2}\d{3,4}\.(ZCE|DCE|SHFE|INE|CFFEX|GFEX)$", re.I), "futures"),
     # Global futures: product+month-code (e.g. ESZ4, CLF25, GCM2025)
@@ -43,9 +59,101 @@ _MARKET_PATTERNS = [
     # Forex pairs: XXX/YYY or XXXXXX.FX
     (re.compile(r"^[A-Z]{3}/[A-Z]{3}$"), "forex"),
     (re.compile(r"^[A-Z]{6}\.FX$"), "forex"),
+    # Yahoo notations for FX and futures. ``=X`` is Yahoo's forex form
+    # (``XAUUSD=X``, ``EURUSD=X``, ``GBPCNY=X``); ``=F`` is Yahoo's
+    # continuous-front-month futures form (``GC=F``, ``CL=F``, ``SI=F``,
+    # ``HG=F``, ``MGC=F``). The underlying asset classes differ, so the
+    # patterns route to different markets. Both must come BEFORE any
+    # length-based fallback to win over the catch-all US-equity regex below.
+    # The ``=X`` width stays {3,6} as it was on main: this PR only asserts
+    # 6-character pairs, so narrowing it to {6} would drop shorter forms
+    # already covered here for no gain.
+    (re.compile(r"^[A-Z]{3,6}=X$", re.I), "forex"),
+    (re.compile(r"^[A-Z]{2,5}=F$", re.I), "futures"),
+    # Bare 6-character precious-metal / FX symbols (``XAUUSD``, ``XAGUSD``,
+    # ``XPTUSD``, ``XPDUSD``, ``EURUSD``, ``GBPUSD``, ``USDJPY``, ``USDCHF``,
+    # ``AUDUSD``, ``NZDUSD``, ``USDCAD``). Whitelist-restricted to a small
+    # set of base codes so legitimate US tickers of any 6-letter length are
+    # never re-routed. The four metal codes are ISO 4217; the rest are G10
+    # currencies. Length-only patterns (``^[A-Z]{6}$``) are deliberately
+    # rejected — they over-match tickers like ``NFLXLI`` or ``AMZNLY``.
+    (re.compile(
+        r"^(?:XAU|XAG|XPT|XPD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|USD)[A-Z]{3}$",
+        re.I,
+    ), "forex"),
+    # Yahoo index symbols (^SPX, ^NDX, ^FTSE, ^VIX, ...) — served verbatim,
+    # same as the =F/=X conventions. Classified as their own market so they
+    # never route through an equity/China chain or a cash currency. Kept from
+    # main: this PR's branch point predates it.
+    (re.compile(r"^\^[A-Za-z0-9.\-]+$"), "index"),
+    # Bare US tickers (AAPL, MSFT, SPY, T, ...). Must stay LAST so every
+    # suffixed equity / futures / crypto / forex form above wins first.
+    # ``{1,5}`` covers every standard US ticker length while 6-char bare
+    # forex/metals (now caught by the whitelist above) and longer crypto
+    # codes (``BTCUSDT``) fall through to the a_share default.
+    (re.compile(r"^[A-Z]{1,5}$", re.I), "us_equity"),
 ]
 
 _CHINA_EXCHANGES = {"CFFEX", "SHFE", "DCE", "ZCE", "INE", "GFEX"}
+
+# Supported settlement-currency contract per market. A composite backtest holds
+# one shared capital pool, so a code set spanning two of these would add CNY to
+# USD to KRW as if they were the same unit. The suffix alone cannot prove an
+# LSE line's currency; UK loaders admit only declared GBP/GBp and reject every
+# other/unknown quote before it reaches this table.
+_MARKET_CURRENCY = {
+    "a_share": "CNY",
+    "us_equity": "USD",
+    "hk_equity": "HKD",
+    "india_equity": "INR",
+    "kr_equity": "KRW",
+    "ca_equity": "CAD",
+    "uk_equity": "GBP",
+    "vietnam_equity": "VND",
+    # Every crypto pattern in _MARKET_PATTERNS is USDT-quoted, and USDT is
+    # carried at its USD peg. This is the one approximation in the table: a
+    # depeg would make a crypto+US book wrong by the depeg amount, which is
+    # orders of magnitude below the CNY/USD-style unit error this guard exists
+    # to catch.
+    "crypto": "USD",
+}
+
+# Non-US futures venues. The GlobalFuturesEngine is USD-denominated end to end
+# — margin, commission and contract multipliers are all in USD and it carries
+# no EUR or JPY product — so anything it handles settles in USD unless the
+# symbol names a venue that does not.
+_FUTURES_EXCHANGE_CURRENCY = {"EUREX": "EUR"}
+
+
+def code_currency(code: str) -> str:
+    """Return the supported settlement-currency contract for a symbol.
+
+    Args:
+        code: Ticker / symbol string.
+
+    Returns:
+        A currency code such as ``"CNY"``. A forex pair resolves to its quote
+        currency and Chinese futures to ``"CNY"``. A symbol whose currency
+        cannot be established returns a ``"UNKNOWN:<market>"`` marker rather
+        than a guess, so a homogeneous set still compares equal while a mixed
+        one cannot pass a same-currency check by accident.
+    """
+    market = _detect_market(code)
+    if market in _MARKET_CURRENCY:
+        return _MARKET_CURRENCY[market]
+    if market == "forex":
+        pair = code.upper().replace("/", "")
+        if pair.endswith(".FX"):
+            pair = pair[:-3]
+        if pair.endswith("=X"):
+            pair = pair[:-2]
+        return pair[3:6] if len(pair) == 6 else "UNKNOWN:forex"
+    if market == "futures":
+        if _is_china_futures(code):
+            return "CNY"
+        exchange = code.upper().rpartition(".")[2]
+        return _FUTURES_EXCHANGE_CURRENCY.get(exchange, "USD")
+    return f"UNKNOWN:{market}"
 
 # Known Chinese-futures product codes — used as a heuristic when a symbol
 # lacks an exchange suffix (e.g. bare ``RB2410``, ``IF2406``). Without this
@@ -72,8 +180,13 @@ def _detect_market(code: str) -> str:
         code: Ticker / symbol string.
 
     Returns:
-        Market type (a_share/us_equity/hk_equity/crypto/futures/forex);
-        unknown defaults to ``a_share``.
+        Market type (a_share/us_equity/hk_equity/india_equity/kr_equity/
+        ca_equity/crypto/futures/forex).
+        Bare 1-5 letter alphabetic tickers resolve to ``us_equity``;
+        bare 6-letter codes that start with a precious-metal or G10
+        currency code (whitelist) resolve to ``forex``; Yahoo's
+        ``=F`` (futures) and ``=X`` (forex) notations are recognized;
+        any other unknown format defaults to ``a_share``.
     """
     for pattern, market in _MARKET_PATTERNS:
         if pattern.match(code):
@@ -113,17 +226,23 @@ def _is_china_futures(code: str) -> bool:
 
 
 def _detect_submarket(codes: List[str]) -> str:
-    """Detect US vs HK from symbol suffixes.
+    """Detect US, HK, Canada, or UK from symbol suffixes.
 
     Args:
         codes: Instrument codes.
 
     Returns:
-        ``"hk"`` if any code ends with ``.HK``, else ``"us"``.
+        ``"hk"`` for ``.HK``, ``"ca"`` for ``.TO``/``.V``, ``"uk"`` for
+        ``.L``, else ``"us"``.
     """
     for code in codes:
-        if code.upper().endswith(".HK"):
+        upper = code.upper()
+        if upper.endswith(".HK"):
             return "hk"
+        if upper.endswith((".TO", ".V")):
+            return "ca"
+        if upper.endswith(".L"):
+            return "uk"
     return "us"
 
 # ── Crypto: OKX tiered maintenance margin table (simplified) ──
@@ -138,6 +257,19 @@ _TIER_TABLE = [
 ]
 
 FUNDING_HOURS = {0, 8, 16}
+
+
+def _interval_span_hours(interval: str) -> float | None:
+    """Bar span in hours for a runner interval token, ``None`` when unknown.
+
+    The runner accepts only 1m/5m/15m/30m/1H/4H/1D, so ``m`` is minutes here
+    (there is no monthly token to confuse it with).
+    """
+    token = str(interval).strip()
+    for suffix, scale in (("m", 1 / 60), ("H", 1.0), ("D", 24.0)):
+        if token.endswith(suffix) and token[: -len(suffix)].isdigit():
+            return int(token[: -len(suffix)]) * scale
+    return None
 
 
 def _maintenance_rate(notional_usd: float) -> float:
@@ -156,6 +288,7 @@ def calc_crypto_funding_fee(
     funding_rate: float,
     applied_set: set,
     daily_done_set: set,
+    bar_span_hours: float | None = None,
 ) -> float:
     """Calculate crypto funding fee for one symbol.
 
@@ -168,6 +301,12 @@ def calc_crypto_funding_fee(
             carries no historical ``funding_rate`` column.
         applied_set: (symbol, date, hour) dedup set — mutated.
         daily_done_set: (symbol, date) dedup set — mutated.
+        bar_span_hours: Bar span in hours when known. At 8h or wider the
+            settlement count comes from the span (``max(1, span // 8)`` per
+            bar), because a daily bar can never land on the 8h/16h slots:
+            without this a daily-bar run charges a third of the documented
+            funding model (#1290). Narrower bars keep the slot logic below
+            unchanged.
 
     Returns:
         Fee amount (positive = longs pay, negative = longs receive).
@@ -178,7 +317,14 @@ def calc_crypto_funding_fee(
     current_date = timestamp.date()
     hour = timestamp.hour if hasattr(timestamp, "hour") else 0
 
-    if hour in FUNDING_HOURS:
+    settlements = 1
+    if bar_span_hours is not None and bar_span_hours >= 8:
+        settlements = max(1, int(bar_span_hours // 8))
+        key = (symbol, current_date, hour)
+        if key in applied_set:
+            return 0.0
+        applied_set.add(key)
+    elif hour in FUNDING_HOURS:
         key = (symbol, current_date, hour)
         if key in applied_set:
             return 0.0
@@ -201,7 +347,24 @@ def calc_crypto_funding_fee(
     hist = bar.get("funding_rate")
     if hist is not None and pd.notna(hist):
         funding_rate = float(hist)
-    return notional * funding_rate * pos.direction
+    return notional * funding_rate * pos.direction * settlements
+
+
+def _liquidation_mark(bar: pd.Series, pos: Position) -> float:
+    """Adverse price the liquidation check and the fill both use.
+
+    Bar high for a short, low for a long -- mirroring the strict path's
+    "adverse" convention (perpetual_risk._mark_price) -- falling back to the
+    close, then the entry price, for bars without high/low. Detection and
+    execution share the same mark so a wick trigger never fills at a better
+    price than the venue that liquidated it.
+    """
+    mark_price = bar.get("high" if pos.direction < 0 else "low")
+    if mark_price is None or pd.isna(mark_price):
+        mark_price = bar.get("close")
+    if mark_price is None or pd.isna(mark_price):
+        mark_price = pos.entry_price
+    return float(mark_price)
 
 
 def check_crypto_liquidation(
@@ -211,20 +374,17 @@ def check_crypto_liquidation(
 ) -> bool:
     """Check if a crypto position should be liquidated.
 
-    Args:
-        symbol: Instrument code.
-        bar: Current bar data.
-        positions: Shared positions dict.
-
-    Returns:
-        True if liquidation should be triggered.
-        Does NOT execute the liquidation -- caller handles that.
+    Fires when equity in the position (margin + unrealized) falls at or below
+    the maintenance margin, marked at the adverse extremum so an intra-bar
+    wick counts. A 1x long is exempt because its bankruptcy price is zero; a
+    1x short is not -- margin is the full notional and a 2x adverse move
+    zeroes it. Does NOT execute the liquidation -- the caller handles that.
     """
     pos = positions.get(symbol)
-    if pos is None or pos.leverage <= 1.0:
+    if pos is None or (pos.leverage <= 1.0 and pos.direction > 0):
         return False
 
-    mark_price = float(bar.get("close", pos.entry_price))
+    mark_price = _liquidation_mark(bar, pos)
     margin = pos.size * pos.entry_price / pos.leverage
     unrealized = pos.direction * pos.size * (mark_price - pos.entry_price)
 
