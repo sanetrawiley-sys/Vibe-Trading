@@ -1,6 +1,6 @@
 {
   "app": {
-    "version": "v0.1.14"
+    "version": "v0.1.15"
   },
   "charts": {
     "noPriceData": "Noch keine Kursdaten für dieses Symbol",
@@ -675,6 +675,8 @@
     "noBacktestSummary": "Keine Backtest-Zusammenfassung aufgezeichnet.",
     "noReproducibilityHashes": "Keine Reproduzierbarkeits-Hashes aufgezeichnet.",
     "noScalarMetrics": "Keine skalaren Metriken aufgezeichnet.",
+    "noStructuredMetrics": "Keine strukturierten Kennzahlen aufgezeichnet.",
+    "structuredMetrics": "Strukturierte Kennzahlen",
     "noValidationPayload": "Keine Validierungsdaten aufgezeichnet.",
     "noArtifactChecksums": "Keine Artefakt-Prüfsummen aufgezeichnet.",
     "noCodeFiles": "Keine Codedateien.",
