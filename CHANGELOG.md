@@ -7,6 +7,111 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Stock profiles carry the listing's own identity** (#1577). `get_stock_profile`
+  returns a `listing` block beside the issuer's fundamentals: Yahoo's symbol,
+  exchange, quote type and quote currency, plus the financial currency and
+  underlying symbol when Yahoo declares them. A secondary listing no longer
+  reads as the primary one. `GOOGL.BA` is an ARS line in Buenos Aires carrying
+  Alphabet's USD financials, and `GGALD.BA` is a USD line whose issuer reports
+  in ARS. Nothing is inferred from the ticker.
+
+- **Volume statistics in `technical_indicators`** (#1571). The tool returns the
+  latest volume, its 20-bar mean and their ratio, computed from the bars it
+  already fetched. The mean needs a complete 20-bar window. `volume.unit` is
+  the unit the serving source declares (board lots on the A-share sources,
+  shares on the Yahoo family, `null` when undeclared), because the two are
+  100x apart and nothing in the numbers tells them apart.
+
+- **Argentina (BYMA) market data** (#1543). A `.BA` symbol — a BYMA listing or a
+  locally traded CEDEAR — is its own market `ar_equity`, quoted in ARS, served
+  by `yahoo` → `yfinance` → `local`, and reported as market `ar` by
+  `get_stock_profile`. Execution is deliberately not modelled: an Argentine
+  backtest raises instead of borrowing US or crypto commissions, lot sizes,
+  settlement and short-selling rules. The Web UI carries the market too —
+  Settings source priority, the positions asset-class grouping and the sector
+  union — and with it `uk_equity`, `vietnam_equity` and `index`, which had been
+  missing from one or more of those three since they landed. `EnvConfig.data`'s
+  per-market `MARKET_DATA_ORDER_*` fields are now guarded against
+  `FALLBACK_CHAINS` instead of a hand-written list, which is why `uk_equity`
+  never had one.
+
+- **Weekly and monthly bars** (#1479). `get_market_data` and backtests take
+  `1W` and `1M` (and `1w` / `1wk` / `1mo`). Loaders are still asked for daily
+  bars; `loaders.base.resample_bars` builds the period bar at the three fetch
+  boundaries (runner, market data, benchmark), so a weekly bar is the same
+  whichever source served the days, at that source's daily caliber. A week
+  runs Monday to Sunday, a month is a calendar month, and each bar is dated on
+  the last trading day inside it: first open, highest high, lowest low, last
+  close, summed volume and amount, volume-weighted vwap, mean funding rate.
+  Annualisation is 52 / 12; a weekly perpetual bar settles 21 funding periods.
+  `1M` is matched before any case fold, which read it as one minute in
+  strict-100x validation and in attribution (98,280 bars a year). The
+  technical-indicator tool canonicalises its documented `1wk` / `1mo` and
+  fetches whole periods instead of two days per bar.
+
+- **IM channels are configured from the Web UI** (#1520, #1529; #1519, #1530).
+  The Settings panel renders each built-in channel's fields from backend
+  metadata, masks secrets (`****` plus the last four characters, never sent
+  back), tests the unsaved form against the provider (`ok` /
+  `invalid_credentials` / `network` / `unsupported`), and hot-swaps only the
+  saved channel with no restart. DingTalk and QQ have guided setups; a shared
+  token probe backs both. Saves write `channels.<name>` in
+  `~/.vibe-trading/agent.json` atomically at mode 0600; a YAML config is shown
+  read-only. Reloads of one channel are serialized in `ChannelManager`, and
+  `stop_all` cancels a reload's start that is still connecting.
+- **Email and WebSocket join the guided Web UI channel setup** (#1544, after
+  #1519). Both channels get hand-written field metadata — localized
+  labels, masked secrets — plus connection tests and per-channel hot apply.
+  Email's test probes the real IMAP login, mailbox select and SMTP login
+  without ever sending a message; WebSocket is a server channel with no
+  remote credentials, so its test validates the TLS cert/key material and
+  binds every resolved address locally — an address held by the
+  already-running server reads as the expected state, not a failure. Saving
+  a WebSocket config hot-swaps the server: connected clients (including the
+  Web UI chat) briefly disconnect and reconnect. A hand-written field hint's
+  secret flag is now authoritative for the keys it covers — the regex
+  fail-safe still masks every unhinted key — so token-shaped non-secrets
+  such as `websocket_requires_token` stay visible and editable instead of
+  being masked, and a form save can no longer silently flip the stored token
+  requirement. The web config routes now build the WebSocket adapter with
+  the gateway services it requires; previously every WebSocket save or test
+  failed validation. Email's polling loop also skips stale-config
+  delete/move post-actions once a stop or hot swap begins, while the
+  already-fetched batch is still delivered. Both the probe and the polling
+  loop now send an RFC 2971 IMAP `ID` after login: NetEase mailboxes
+  (163/126/yeah.net) accept the login but reject the first `SELECT` with
+  `Unsafe Login` until the client identifies itself, so without this the
+  Email channel could not read the most common Chinese mailboxes. The
+  identification is static and carries no user data or secrets, and servers
+  that ignore `ID` are unaffected; verified end-to-end against a live
+  163.com account.
+- **Bahasa Indonesia** UI locale and `README_id.md` (#1482). The README count
+  tests cover it, and `MANIFEST.in` now ships `README_es.md` and
+  `README_id.md`.
+- **Portfolio valuation accepts any ISO-4217 currency** (#1510). A source whose
+  currency has no FX rate fails with the currency named and is excluded from
+  the totals; the healthy sources stay in.
+
+- **Gildata (恒生聚源) joins the A-share fallback chain as a token-gated
+  source**. The new `gildata` loader talks to the vendor's raw-api MCP
+  endpoint (one JSON-RPC POST per call, token in the Authorization header) and
+  serves A-share daily OHLCV through the `StockDailyQuote` tool with
+  `restorationStatus=1` — forward, split-AND-dividend adjusted bars, stamped
+  `split_dividend` in the price-caliber table after being measured against a
+  live payload. Volume arrives in 万股 and is converted to shares
+  (`volume_units: shares`); `avgprice`/`prevcloseprice` are ignored because
+  the vendor keeps them on a different adjustment basis than the adjusted
+  OHLC. An unresolvable symbol answers `rows: []` (never an error), so the
+  chain keeps walking. Auth is `GILDATA_TOKEN` (Settings page field or env;
+  `GILDATA_BASE_URL` overrides the endpoint, `VIBE_TRADING_GILDATA_MIN_INTERVAL`
+  the 0.3s default spacing). Without a token the loader reports unavailable
+  and the chain skips it — no behavior change for existing users beyond one
+  reorderable entry at the chain's tail. One migration note: a
+  `MARKET_DATA_ORDER_A_SHARE` value saved before this change is a permutation
+  of the old 7-source chain, so it stops validating once `gildata` joins —
+  the Settings card flags it and the default order applies until the saved
+  order is re-saved (one click) with the new source included.
+
 - **A Robinhood account can be a read-only portfolio source** (#1428). The new
   `robinhood-live-mcp-readonly` profile uses the same MCP server and OAuth
   grant as the trading profile. Its connection reads exactly one account,
@@ -21,6 +126,35 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   fixed income fails the source instead of showing an equity-only view.
 
 ### Changed
+
+- **`source="qveris"` refuses markets with splits and dividends** (#1494). It
+  picks a capability by search rank, which ignores adjustment: for 600519.SH
+  the top pick was FMP's non-split-adjusted EOD, and a tool named adjusted
+  returned raw closes. Stocks and ETFs are refused before anything is searched
+  or billed; crypto, forex, futures, macro and index bars are served as before.
+  Both QVeris budget gates reserve only a flat per-call quote now:
+  `1 credits/result` had reserved 1 credit for a call that billed 9.66, and
+  `qveris_execute` returns `quote_not_bounded` for any other shape.
+- **A price index is stamped `raw`** (#1541). Eastmoney's fqt=1 equals fqt=0
+  on every bar of the A-share indices measured, Tencent serves only `day` for
+  the SSE/SZSE ones, and Yahoo's adjclose equals close on ^GSPC / ^NDX / ^HSI, but the
+  per-source table stamped an A-share index additive and a Yahoo index
+  dividend-adjusted. `price_caliber` takes the symbol; A-share index codes are
+  matched per exchange, since 000001.SZ is Ping An Bank.
+- **Portfolio valuation version 3** (#1510): snapshots stored under version 2
+  are no longer read, so portfolio history starts again after upgrading.
+- **Tencent, Eastmoney and AKShare A-share prices are labelled
+  `split_dividend_additive`** (#1497, #1493). Their forward adjustment
+  subtracts cash dividends from the level instead of scaling by a ratio (on
+  600519.SH, qfq minus raw takes five values over 500 bars against 367
+  distinct ratios), so a basket mixing them with multiplicative sources warns,
+  and a run served only by them warns that its returns are not total returns.
+  Tencent's HK series is labelled `raw`: it serves no adjusted HK bars. The
+  prices themselves are unchanged.
+- `connector account` renders Binance spot balances as Asset / Free / Locked /
+  Total, Futu's per-currency `assets`, and Trading 212's `cash` and `metadata`
+  (#1539); before, Binance printed blank rows and the other two printed "No
+  account summary returned."
 
 - **The final-answer grounding gate no longer guesses what a number is from the
   words around it.** Only a number's SHAPE is inferred — a decimal point, a
@@ -74,7 +208,226 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   page shows "Checking the figures in this answer (round N)…" until answer text
   arrives, in all eight locales.
 
+### Removed
+
+- **The Requesty built-in provider.** Its capabilities were OpenRouter's, with
+  no adapter of its own. Same request shape: `LANGCHAIN_PROVIDER=openrouter`,
+  `OPENROUTER_BASE_URL=https://router.requesty.ai/v1`, and the Requesty key as
+  `OPENROUTER_API_KEY`.
+
 ### Fixed
+
+- **A dollar-quoted BYMA or TSX line, or a Hong Kong RMB or USD counter, no
+  longer enters a single-currency backtest** (#1576, after #1543). Both venues
+  list USD lines beside their home-currency ones. On 2026-09-24 Yahoo declared
+  USD for GGALD.BA (4.20), SPYD.BA and AAPLD.BA, and for DLR-U.TO and
+  XUS-U.TO. `ar_equity` and `ca_equity` are each one static-currency pool, so
+  such a line was priced as pesos or Canadian dollars. As on the LSE, the
+  loaders now read the declared currency. They admit a `.BA` line only in ARS
+  and a `.TO` / `.V` line only in CAD. A trailing `D` does not decide it:
+  YPFD.BA is a peso line. Every other declared quote currency is recorded in
+  market-data provenance, and the grounding gate asks an answer to name that
+  currency rather than the one the suffix implies. Hong Kong is decided by the
+  code, because the Hong Kong chain starts with sources that declare no
+  currency: HKEX's Stock Code Allocation Plan assigns 80000-89999 to products
+  traded in renminbi and several 09xxx ranges (plus 10900-10999 and
+  41500-41599) to products traded in USD. So an RMB counter (80700.HK, 375.40
+  CNY on 2026-09-24) or a USD ETF (9834.HK) is refused in a Hong Kong or
+  cross-market backtest, is counted in its own currency by the mixed-currency
+  guard, and is quoted in that currency by the grounding gate, whichever
+  source served it. The table matched the currency Yahoo declared for all 24
+  codes probed across the ranges.
+- **Grounding identity and symbol search know every market the data layer
+  routes** (#1565, #1575). `.BA`, `.L` and `.VN` symbols had no
+  canonical-symbol scan, venue or currency in grounding. Symbol search
+  labelled Indian, Korean, British, Vietnamese and Argentine results `global`.
+  A parity test now takes the market list from the backtest's own currency
+  table. An answer may write £, ₫ or AR$ for the currency it has to name.
+- **An explicit provider header survives an ambient twin** (#1573, #1568).
+  When `OPENAI_CUSTOM_HEADERS` names a header the provider also sets (a
+  `user-agent` beside the Kimi / NVIDIA / OpenCode `User-Agent`), openai 3.19.2's
+  case-insensitive merge dropped the provider's value. That turned CI red for
+  every PR on 2026-09-24. The first fix proposed would have sent both headers
+  under openai 2.53, the version the lock file and the Docker image install.
+  Every ambient spelling is now omitted and the explicit value re-set after
+  the omits, which holds under both.
+- **Backtests align calendars at any timestamp resolution** (#1560). The engine
+  merged symbol calendars and placed prices through raw nanosecond integers,
+  but a local duckdb source serves microseconds. Such a run was dated
+  1970-01-21, and beside a nanosecond source one symbol's closes came back
+  empty. The rebalance mask had the same unit mismatch.
+- **A research goal that is an order is still refused** (#1562). The execution
+  filter no longer rejects research that mentions shares or coins ("should the
+  fund sell its GOOGL shares"). It refuses an objective that opens with buy or
+  sell, puts a quantity right after the verb, or writes 买入 / 卖出 with a
+  quantity and a unit. The first version of the change had made "Buy 100
+  shares of NVDA" an accepted goal.
+- **A strict-bench OOS split needs two IC observations on each side** (#1559).
+  A split outside the loaded prices is refused. An alpha whose IC series
+  leaves fewer than two observations on either side is skipped, with the
+  counts in the reason. The IC series ends one forward-return horizon before
+  the prices, so a split one bar from the end used to publish verdicts
+  measured on nothing.
+- **Quant inputs are checked before they are used** (#1555-#1558). HRP aligns a
+  supplied correlation matrix, and the covariance's own rows, to the
+  covariance's column labels; swapping two rows used to move the weights with
+  no error. Purged cross-validation refuses an unordered or duplicated
+  timestamp index, and a label that ends before it starts. Impact models and
+  every fixed-income entry point refuse NaN and infinities instead of
+  returning NaN prices, durations and curves.
+- **Shadow-account overtrading uses the whole trading window** (#1563). A long
+  hold that closed before later short trades no longer shrinks the span.
+- **Asset growth is year over year on the daily panel** (#1564). Derived
+  fundamentals run on a panel densified to the price calendar, where a one-row
+  lag compared yesterday with today: 0% on ordinary days and a one-day spike
+  at each filing. The lag is now 365 days, as-of.
+- **A tail-risk figure names its own field once a session holds more than one**
+  (#1425, after #1444). A call- or tool-scoped ref (`ref x1`) pooled every
+  tail-risk field that call returned, and an undeclared tail-risk percent pooled
+  every tail-risk value in the session, so an ES 95% could quote the VaR 95%
+  value and pass. The rule is read off the evidence, never off prose:
+  `tail_risk_identity()` takes (measure, confidence) from the field name a tool
+  returned, so `var_95` and `es_95` are two identities while `cvar_99` and
+  `es_99` are one. When a scope holds two or more and the figure's value matches
+  one of them, it is refused with `tail_risk_needs_field_ref`, whose correction
+  names every identity the session holds; a figure matching no tail-risk value
+  keeps its old reason, so a fabricated number is still a mismatch rather than a
+  missing ref. Accepted cost, stated in the issue: an undeclared VaR 95% beside a
+  VaR 99% is correct today and now costs one correction round. The system prompt
+  states the rule so a risk report declares the ref on its first attempt.
+- **Mean-variance style optimizers size a short by its own expected return**
+  (#1548). The optimizers scored every position as if it were held long, so the
+  strongest shorts (most negative drift) looked worst and got the least capital.
+  `BaseOptimizer.optimize` now negates a short's column before building the
+  context, so `mu` is the position's expected return AND `cov` is the position
+  covariance `D Σ D`: a long and a short of two +0.92 correlated names hedge
+  instead of reading as correlated (the old objective put the whole book on the
+  long, the new one splits it 0.514 / -0.486). Risk-parity and
+  max-diversification contexts get the position covariance with it;
+  volatility-only contexts are unchanged, since std(-r) == std(r).
+- **Monte-Carlo validation annualises at the venue's bars per year** (#1546). It
+  hardcoded 252 while `bootstrap_sharpe_ci` and `walk_forward_analysis` in the
+  same report used the resolved value, so a crypto (365) or forex (260) run
+  published two disagreeing Sharpes.
+- **A futures order on a negative-price bar is no longer rejected outright**
+  (#1547). `FuturesBaseEngine` dropped the `abs(price)` its base class relies on
+  under `allow_nonpositive_prices`, so size came out negative and the caller's
+  `size <= 0` guard refused every order.
+- **A factor's IC ratio is unset for a negative baseline** (#1549). Dividing two
+  negative IC means gives a positive ratio, so a rolling IC that got further
+  below zero reported as improvement. The signal itself took the worst of the
+  available metrics and was not fooled; the published number was.
+- **Two memories sharing a title keep separate index rows and links** (#1545).
+  Under `VT_MEMORY_HIERARCHY` an entry lives at `{memory_type}/{slug}.md`, so
+  two entries with one title had the same `path.name`: the second `add()`
+  overwrote the first's `MEMORY.md` row, and the semantic-link block beside it
+  excluded the other entry as "self" and wrote an ambiguous target. Both key on
+  the path relative to the memory dir now; a sidecar written earlier, with a
+  bare filename or an absolute path, is still read.
+- **The Email channel verifies TLS certificates by default** (#1544). The
+  implicit-SSL paths (`IMAP4_SSL` / `SMTP_SSL`) in both the connection probe
+  and the polling/send adapter used Python's default unverified context
+  (`CERT_NONE`, no hostname check), so the mailbox password travelled to a
+  server whose certificate was never checked — an active network attacker
+  between the operator and their mail provider could harvest it. All four call
+  sites now build their context through a shared `email_tls_context()` that
+  verifies the certificate and hostname against the system CA bundle, matching
+  the STARTTLS path, which already did. A new `verify_tls` field (default
+  `true`, surfaced in the guided Email setup in all nine locales) is the
+  documented opt-out for self-signed or internal-CA servers. **Upgrade note:**
+  a mail server with such a certificate connected before this change and now
+  fails the TLS handshake until `verify_tls` is set to `false` for it.
+- **Plain IMAP no longer sends the mailbox password in clear text** (after
+  #1544). With `imap_use_ssl` off, the Email channel and its connection test
+  logged in over an unencrypted connection, and the guided setup put that
+  switch one click away. A new `imap_use_tls` (on by default, the IMAP twin of
+  `smtp_use_tls`) upgrades the connection with STARTTLS before `LOGIN`; a
+  server that offers no STARTTLS is reported as a network failure before the
+  password is sent. `verify_tls` now governs STARTTLS on IMAP and SMTP as well
+  as implicit SSL, so a self-signed server can opt out on any path. **Upgrade
+  note:** an `imap_use_ssl: false` setup against a server without STARTTLS
+  stops connecting until `imap_use_tls` is set to `false` for it, which sends
+  the password in plain text again.
+- **Settings-write routes reject cross-site browser requests** (#1544).
+  `require_settings_write_auth` did not apply the cross-site guard that its
+  siblings `require_auth` and `require_event_stream_auth` enforce on unsafe
+  methods, so a malicious web page could attempt a CSRF write against any
+  settings route — including the new `POST /channels/email/test`, which merges
+  stored credentials with a caller-supplied patch and could be steered to send
+  the stored mailbox password to an attacker-chosen host. The guard now runs
+  first on every settings-write route; same-origin Web UI calls and
+  non-browser clients (CLI/curl, no `Origin`) are unaffected.
+- **Read-only results lost to context compaction are restored, not refetched**
+  (#1488). A successful read-only call whose payload compaction removed is
+  replayed from the run's own cache, at most six times a run; past the cap it
+  runs again, as it did before, instead of being refused with "use the
+  previous result" for a payload the model cannot see. The cap is checked per
+  restore, and any successful write empties the cache, so a regenerated file
+  is read afresh. `read_url` opts in; `no_cache=true` always fetches.
+- **Tail-risk figures keep their identity under a field ref** (#1444). A
+  declared `ref` may name an evidence field by its full path
+  (`data.tail_risk.var_95`) or trailing part (`var_95`), or one call's field
+  (`q1::historical_var`); a VaR 99% quoting the 95% value, or ES quoting VaR,
+  is rejected under such a ref. A field two calls returned with different
+  values is ambiguous and the correction names the refs to choose from. A
+  claim scoped to a whole call or not declared is still matched against every
+  tail-risk value it can see (#1425 stays open).
+- **A backtest aborted when a funding debit left cash below zero** (#1542).
+  CompositeEngine and CryptoEngine subtract crypto funding from capital with
+  no floor, and the next open then fitted at no scale, not even an empty plan:
+  the open-basket search kept the full-scale plan and the run died with
+  "planned order … exceeds available capital", and a rebalance raised
+  "insufficient capital for position rebalance". Such an open is now skipped
+  and reported once as `insufficient_capital`, the bar's reductions still
+  run, and a close whose loss exceeds its margin still aborts the bar (#1274).
+- The grounding gate reads decimal commas (#1517): `17,93 %` and
+  `1.410,00 CNY` ground against tool results, two unspaced numbers such as
+  `1400,1777` stay two numbers, and a written figure must match its evidence
+  within half a unit of its last written digit (a truncated `30.20%` for
+  30.2052% is now sent back for correction). One shape regex added (14 → 15).
+- Block trades, margin trading and financial statements no longer read
+  Eastmoney rejecting a stale query (code 9501) as an empty result; all six
+  datacenter callers share `eastmoney_client.datacenter_rejection`.
+- **24 alphas emitted a value computed from a missing bar** (#1463, #1523,
+  #1534, #1452). A comparison over an operand that is NaN because its window
+  holds the gap is False, and the #1463 sweep, which nudged the bar by a tick,
+  could not see that. A second oracle compares the gapped run with the gap-free
+  one. Comparison gates and `np.fmin`/`np.fmax` now mask on their inputs' reach
+  (`factors.base.observed_over`) rather than on their operands' NaN, so a
+  correlation undefined on complete data keeps its old verdict; the six
+  fmax/fmin alphas converted on 2026-09-18 had lost up to 87% of their
+  post-warmup values in a 5-symbol universe that way and are restored. On
+  gap-free data no finite value changed.
+- Lockup expiry: `free_shares` is the unlocking quantity
+  (`CURRENT_FREE_SHARES`), not the float; units are stated (万股 / 万元) (#1513,
+  #1501). The report is `RPT_LIFT_STAGE`; the old one rejected six columns.
+- Dragon-tiger seats come from the buy/sell detail reports, surface a provider
+  rejection, and rank within each listing reason (#1512, #1502).
+- Shareholder-count history returns real periods from `RPT_HOLDERNUM_DET`,
+  states each row's previous period, and warns when the average-holding join
+  fails (#1518, #1503).
+- QVeris resolves adjusted fields as a complete set, one family per response,
+  and no longer gives an unadjusted bar the adjusted volume (#1527, #1494).
+- Channel adapters log through stdlib again: `{}` placeholders, napcat's 17
+  sites and loguru-only `.opt()` calls lost their messages (signal's
+  `_safe_handle` raised instead of swallowing) (#1533, #1531). Slack DMs from
+  unapproved senders get a pairing code (#1524); Discord no longer pings
+  `@everyone` or roles (#1537); duplicate-reply suppression covers integer
+  message ids and is bounded (#1476); the WebSocket channel starts again (from
+  #1521).
+- Shadow account: an `other`-market rule no longer matches every symbol
+  (#1538), and overtrading PnL no longer double-counts trades already
+  explained (#1475).
+- Quantlib: comps refuses negative bridge magnitudes like the DCF bridge
+  (#1535); accrued interest is exact on coupon dates under 30/360 and rejects
+  an unknown day count there too (#1509); Kyle's lambda fits an intercept
+  (#1477).
+- ML strategy: a single-class training window is skipped and the previous
+  model keeps predicting (#1522). Memory: two entries with one title and
+  different types keep separate index rows, and `forget` names the type when
+  ambiguous (#1525). Swarm run and task files use unique temp names (#1536).
+- `/agent.json`, `/agent.yaml` and `/agent.yml` are gitignored at the runtime
+  root; the Feishu QR login already wrote channel credentials there.
 
 - **OpenAI's gpt-5.6 models run with their reasoning on the agent's default
   configuration** (#1473). `/v1/chat/completions` refuses function tools for

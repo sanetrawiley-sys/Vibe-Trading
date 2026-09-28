@@ -80,6 +80,13 @@ SUMMARY_CHUNK_CHARS = 80_000
 # retry once with a nudge before failing the run on a second consecutive one.
 MAX_CONSECUTIVE_EMPTY_RESPONSE_SKIPS = 1
 
+# Compaction recovery is a bounded reliability aid, not an alternate research
+# loop: a run restores at most this many lost readonly payloads from its replay
+# cache. Past the cap a lost call runs again as it does without replay, so the
+# model is never told to use a result it can no longer see, and a loop of
+# identical re-runs still ends at the no-progress limit.
+MAX_READONLY_REPLAY_RECOVERIES = 6
+
 
 def _override(name: str):
     """Return a monkeypatched module-level override if present."""
@@ -469,13 +476,43 @@ def _cleared_text(original_len: int) -> str:
         f"{_CLEARED_PREFIX} this tool call SUCCEEDED and returned "
         f"{original_len} characters, which were removed to free context "
         "space. This is NOT a tool failure and NOT an empty result. If you "
-        "need these values, call the tool again with the same arguments.]"
+        "need these values, request the same tool call again; the loop may "
+        "restore the prior successful result without refetching it.]"
     )
 
 
 def _is_cleared(content: Any) -> bool:
     """True when ``content`` is a layer-1 cleared-result marker."""
     return isinstance(content, str) and content.startswith(_CLEARED_PREFIX)
+
+
+def _replay_context_result(result: str) -> str:
+    """Annotate a restored readonly result with planner guidance.
+
+    Replay exists to recover evidence that context compaction removed, not to
+    trigger another fetch under slightly different freshness arguments. Keep
+    the original payload intact and add a reserved metadata field when the
+    result is a JSON object; non-JSON results get a short textual suffix.
+    """
+    notice = (
+        "Exact prior successful result restored after context compaction. "
+        "Treat this payload as available evidence and continue the analysis. "
+        "Do not change cache/freshness arguments merely to bypass replay; "
+        "request a fresh fetch only when the evidence itself is stale/cached "
+        "or the task genuinely requires newer data."
+    )
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return f"{result}\n\n[Replay notice: {notice}]"
+    if not isinstance(payload, dict):
+        return f"{result}\n\n[Replay notice: {notice}]"
+    replay_payload = dict(payload)
+    replay_payload["_vibe_replay"] = {
+        "restored": True,
+        "notice": notice,
+    }
+    return json.dumps(replay_payload, ensure_ascii=False)
 
 
 def _microcompact(messages: list) -> list:
@@ -576,12 +613,19 @@ def _context_collapse(messages: list) -> None:
 def _msg_estimate_chars(msg: dict) -> int:
     """Rough character size of a message for token budgeting.
 
-    Sizes ``content`` plus every tool-call ``arguments`` payload. Assistant
-    tool-call messages carry their payload in ``tool_calls[].function.
-    arguments`` with empty ``content``; sizing them by content alone made the
-    layer-3 tail budget count a 100 KB arguments blob as ~10 tokens.
+    Sizes ``content`` plus ``reasoning_content`` plus every tool-call
+    ``arguments`` payload. Assistant tool-call messages carry their payload in
+    ``tool_calls[].function.arguments`` with empty ``content``; sizing them by
+    content alone made the layer-3 tail budget count a 100 KB arguments blob
+    as ~10 tokens. A thinking-model turn's ``reasoning_content`` (Kimi K2.5,
+    DeepSeek reasoner, Qwen thinking) is the same failure mode: ``estimate_tokens``
+    counts it via full JSON serialization, so leaving it out here undercounts
+    the tail relative to the trigger that decided compaction was needed.
     """
     size = len(str(msg.get("content", "")))
+    reasoning_content = msg.get("reasoning_content")
+    if reasoning_content is not None:
+        size += len(str(reasoning_content))
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function")
         if isinstance(fn, dict) and fn.get("arguments") is not None:
@@ -1113,6 +1157,14 @@ class AgentLoop:
         # 5-9x each (2026-08-20 INTC run) because it could no longer see its
         # own verification records.
         self._called_identical: dict[tuple[str, str], str] = {}
+        # Successful readonly results are retained only for this run. If
+        # compaction removes the visible result, an exact repeat can restore it
+        # without hitting the external source again. Repeatable tools require an
+        # explicit replay policy for persistent post-compaction replay.
+        self._readonly_replay_cache: dict[tuple[str, str], str] = {}
+        self._readonly_replay_ready: set[tuple[str, str]] = set()
+        self._readonly_replay_protected: set[tuple[str, str]] = set()
+        self._readonly_replay_recoveries = 0
         self._tool_progress = ToolProgress()
 
     def cancel(self) -> None:
@@ -1230,6 +1282,10 @@ class AgentLoop:
         self._last_activity_wall = _time.time()
         self._run_done = threading.Event()
         self._called_identical = {}
+        self._readonly_replay_cache = {}
+        self._readonly_replay_ready = set()
+        self._readonly_replay_protected = set()
+        self._readonly_replay_recoveries = 0
         self._tool_progress = ToolProgress()
         run_started_wall = _time.time()
 
@@ -1297,6 +1353,11 @@ class AgentLoop:
         empty_model_response_iter: int | None = None
         consecutive_empty_responses = 0
         grounding_revisions = 0
+        # A normal grounding correction is a text revision, not a new research
+        # turn. Explicit grounding recovery (identity / missing price evidence)
+        # keeps tools available; ordinary correction turns do not.
+        grounding_correction_text_only = False
+        pending_grounding_draft = ""
         llm_usage_summary = _new_llm_usage_summary(self.llm)
         last_response_model: str | None = None
         goal_continuations = 0
@@ -1480,11 +1541,26 @@ class AgentLoop:
                         reasoning_event["tail"] = reasoning_tail
                     self._emit("reasoning_delta", reasoning_event)
 
-                # On last iteration, drop tool definitions to force text output
+                # The final iteration is always text-only. A grounding correction
+                # whose validator requested no explicit recovery is text-only too:
+                # the model must revise from evidence already gathered instead of
+                # starting another research/refetch loop merely to reformat a draft.
                 is_last_iteration = (iteration == self.max_iterations)
-                tool_defs = None if is_last_iteration else self.registry.get_definitions()
+                correction_text_only = grounding_correction_text_only
+                tool_defs = (
+                    None
+                    if is_last_iteration or correction_text_only
+                    else self.registry.get_definitions()
+                )
                 if is_last_iteration:
                     trace.write({"type": "forced_text_only", "iter": current_iter})
+                elif correction_text_only:
+                    trace.write(
+                        {
+                            "type": "grounding_correction_text_only",
+                            "iter": current_iter,
+                        }
+                    )
 
                 _llm_timeout_s = _llm_timeout_seconds()
                 llm_timeout = _llm_timeout_s if _llm_timeout_s > 0 else None
@@ -1657,8 +1733,46 @@ class AgentLoop:
                 # Not filtered — reset the consecutive-skip counter.
                 consecutive_content_filter_count = 0
 
-                if not response.has_tool_calls:
-                    final_content = response.content or ""
+                forced_grounding_release = False
+                if correction_text_only and response.has_tool_calls:
+                    # An unoffered call consumes the same bounded correction
+                    # budget as an invalid revised draft, but is never executed
+                    # or inserted into the transcript as an unanswered tool call.
+                    grounding_revisions += 1
+                    trace.write(
+                        {
+                            "type": "grounding_correction_tool_call_blocked",
+                            "iter": current_iter,
+                            "round": grounding_revisions,
+                        }
+                    )
+                    if streamed_chars:
+                        self._emit(
+                            "stream_reset",
+                            {"iter": current_iter, "reason": "grounding_tool_call_blocked"},
+                        )
+                    forced_grounding_release = (
+                        grounding_revisions >= MAX_GROUNDING_REVISIONS
+                        or iteration == self.max_iterations
+                    )
+                    if not forced_grounding_release:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "<system>This is a grounding correction turn. "
+                                    "Do not call tools. Revise the previous draft using "
+                                    "the evidence already gathered, or remove claims "
+                                    "that cannot be supported.</system>"
+                                ),
+                            }
+                        )
+                        continue
+
+                if forced_grounding_release or not response.has_tool_calls:
+                    # At the cap, release the last actual draft through the
+                    # existing gate. The forbidden call's text is not an answer.
+                    final_content = pending_grounding_draft if forced_grounding_release else response.content or ""
                     syntax_fallback_emitted = False
                     if not final_content:
                         empty_model_response_iter = iteration
@@ -1738,7 +1852,11 @@ class AgentLoop:
                         )
                         syntax_fallback_emitted = True
                     if self._grounding is not None:
-                        validation = self._grounding.validate_final_answer(final_content)
+                        validation = (
+                            self._grounding.revalidate(final_content)
+                            if forced_grounding_release
+                            else self._grounding.validate_final_answer(final_content)
+                        )
                         if not validation.valid:
                             # A draft whose only defect is a missing provenance
                             # word (source / currency / symbol suffix) gets the
@@ -1769,34 +1887,38 @@ class AgentLoop:
                             # the gate, not answer text.
                             final_content = validation.released_text
                         if not validation.valid:
-                            trace.write_text_entry(
-                                {
-                                    "type": "answer_rejected",
-                                    "iter": current_iter,
-                                    "issues": validation.issues,
-                                },
-                                field="content",
-                                value=final_content,
-                                offload_kind=f"answer-rejected-{current_iter}",
-                            )
-                            if not buffer_text_output and streamed_chars:
-                                # The stream showed this draft up to its first unchecked
-                                # number; the next draft or the released answer replaces it.
-                                self._emit(
-                                    "stream_reset",
-                                    {"iter": current_iter, "reason": "grounding_rejected"},
+                            if not forced_grounding_release:
+                                trace.write_text_entry(
+                                    {
+                                        "type": "answer_rejected",
+                                        "iter": current_iter,
+                                        "issues": validation.issues,
+                                    },
+                                    field="content",
+                                    value=final_content,
+                                    offload_kind=f"answer-rejected-{current_iter}",
                                 )
-                            react_trace.append(
-                                {
-                                    "type": "answer_rejected",
-                                    "issues": validation.issues,
-                                }
-                            )
-                            messages.append(
-                                {"role": "assistant", "content": final_content}
-                            )
+                                if not buffer_text_output and streamed_chars:
+                                    # The stream showed this draft up to its first unchecked
+                                    # number; the next draft or the released answer replaces it.
+                                    self._emit(
+                                        "stream_reset",
+                                        {"iter": current_iter, "reason": "grounding_rejected"},
+                                    )
+                                react_trace.append(
+                                    {
+                                        "type": "answer_rejected",
+                                        "issues": validation.issues,
+                                    }
+                                )
+                                messages.append(
+                                    {"role": "assistant", "content": final_content}
+                                )
                             recovery = self._grounding.recovery_action(validation)
-                            if recovery is not None and iteration < self.max_iterations:
+                            if not forced_grounding_release and recovery is not None and iteration < self.max_iterations:
+                                # Explicit bounded recovery is the one case where
+                                # the next turn is allowed to research again.
+                                grounding_correction_text_only = False
                                 self._grounding.record_recovery(recovery)
                                 trace.write(
                                     {
@@ -1824,13 +1946,15 @@ class AgentLoop:
                                 )
                                 final_content = ""
                                 continue
-                            messages.append(
-                                {
-                                    "role": "user",
-                                    "content": f"<system>{self._grounding.correction_prompt(validation)}</system>",
-                                }
-                            )
+                            if not forced_grounding_release:
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": f"<system>{self._grounding.correction_prompt(validation)}</system>",
+                                    }
+                                )
                             rejected_draft = final_content
+                            pending_grounding_draft = rejected_draft
                             final_content = ""
                             # The budget counts drafts rejected on this
                             # correction path; the last one is released with
@@ -1839,11 +1963,14 @@ class AgentLoop:
                             # rather than rewording), so a run that had to
                             # resolve its symbol first still gets a corrected
                             # draft.
-                            grounding_revisions += 1
+                            if not forced_grounding_release:
+                                grounding_revisions += 1
                             if (
-                                iteration < self.max_iterations
+                                not forced_grounding_release
+                                and iteration < self.max_iterations
                                 and grounding_revisions < MAX_GROUNDING_REVISIONS
                             ):
+                                grounding_correction_text_only = True
                                 self._emit(
                                     "grounding_status",
                                     {
@@ -1926,10 +2053,14 @@ class AgentLoop:
                                     "text_delta",
                                     {"delta": final_content[len(shown):], "iter": current_iter},
                                 )
+                    # The correction has ended. A goal continuation is a new
+                    # research turn and must regain its normal tool access.
+                    grounding_correction_text_only = False
+                    pending_grounding_draft = ""
                     should_continue_goal = False
                     continuation_snapshot = None
                     _max_cont = _goal_max_continuations()
-                    if active_goal_id and session_id and _max_cont > 0:
+                    if not forced_grounding_release and active_goal_id and session_id and _max_cont > 0:
                         try:
                             if goal_store is None:
                                 from src.goal import GoalStore
@@ -2342,18 +2473,6 @@ class AgentLoop:
                     iteration,
                 )
                 continue
-            if (
-                dedup_key is not None
-                and dedup_key in self._called_ok
-                and not is_repeatable
-            ):
-                logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
-                skip_msg = json.dumps({"skipped": True, "reason": f"{tc.name} already completed successfully. Use the previous result."})
-                messages.append(context.format_tool_result(tc.id, tc.name, skip_msg))
-                trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
-                react_trace.append({"type": "tool_skipped", "tool": tc.name})
-                continue
-
             if self._grounding is not None:
                 authorization = self._grounding.authorize_tool_call(
                     tc.name,
@@ -2373,6 +2492,84 @@ class AgentLoop:
                         )
                     )
                     continue
+
+            # A successful readonly call whose visible result was removed by
+            # micro/auto-compaction can be replayed from this run's memory. This
+            # extends the existing deterministic-cache pattern without declaring
+            # mutable web resources deterministic. Fresh/no-cache calls bypass
+            # this path, while repeatable calls must explicitly opt in.
+            if (
+                dedup_key is not None
+                and dedup_key in self._readonly_replay_ready
+                and self._readonly_replay_recoveries < MAX_READONLY_REPLAY_RECOVERIES
+                and self._readonly_replay_allowed(tool_def, tc.arguments)
+                and dedup_key in self._readonly_replay_cache
+            ):
+                cached = self._readonly_replay_cache[dedup_key]
+                restored = _replay_context_result(cached)
+                messages.append(
+                    context.format_tool_result(
+                        tc.id, tc.name, truncate_tool_result(restored)
+                    )
+                )
+                self._successful_call_keys[tc.id] = dedup_key
+                self._called_ok.add(dedup_key)
+                self._readonly_replay_ready.discard(dedup_key)
+                self._readonly_replay_recoveries += 1
+                # A repeatable tool would otherwise re-fetch on the very next
+                # identical call; the restored payload is visible now, so that
+                # call is refused until compaction removes it again.
+                if getattr(tool_def, "repeatable", False):
+                    self._readonly_replay_protected.add(dedup_key)
+                # Restoring data that compaction removed is forward progress for
+                # the working context, but not a new external observation.
+                self._tool_progress.mark_context_restored()
+                trace.write({
+                    "type": "tool_result_replayed",
+                    "iter": iteration,
+                    "tool": tc.name,
+                    "call_id": tc.id,
+                    "recovery_count": self._readonly_replay_recoveries,
+                    "recovery_limit": MAX_READONLY_REPLAY_RECOVERIES,
+                })
+                react_trace.append({"type": "tool_result_replayed", "tool": tc.name})
+                self._emit(
+                    "tool_result",
+                    {
+                        "tool": tc.name,
+                        "status": "ok",
+                        "elapsed_ms": 0,
+                        "preview": redact_tool_result(cached)[:200],
+                        "call_id": tc.id,
+                        "cached": True,
+                        "replayed": True,
+                    },
+                )
+                continue
+
+            if (
+                dedup_key is not None
+                and dedup_key in self._called_ok
+                and (
+                    not is_repeatable
+                    or dedup_key in self._readonly_replay_protected
+                )
+            ):
+                logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
+                replay_restored = dedup_key in self._readonly_replay_protected
+                reason = (
+                    f"{tc.name} was just restored from the run-scoped replay cache after "
+                    "compaction. The payload is already visible in context; use that "
+                    "result and continue the analysis instead of requesting the same "
+                    "call again."
+                    if replay_restored
+                    else f"{tc.name} already completed successfully. Use the previous result."
+                )
+                skip_msg = json.dumps({"skipped": True, "reason": reason})
+                messages.append(context.format_tool_result(tc.id, tc.name, skip_msg))
+                trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
+                react_trace.append({"type": "tool_skipped", "tool": tc.name})
+                continue
 
             # Deterministic tools (e.g. financial_rigor calc) return the same
             # result for the same args. Checked AFTER authorization above so a
@@ -2836,6 +3033,27 @@ class AgentLoop:
             return False
         return bool(tool_def and getattr(tool_def, "is_readonly", False))
 
+    def _readonly_replay_allowed(self, tool_def: Any, arguments: Mapping[str, Any]) -> bool:
+        """Whether an exact readonly result may be restored after compaction.
+
+        This is intentionally narrower than ``is_readonly``: deterministic
+        calls already use the existing cache, and ``no_cache=True`` explicitly
+        requests a fresh read. Repeatable calls require explicit opt-in because
+        they may otherwise be intentionally refreshed.
+        """
+        if tool_def is None or not getattr(tool_def, "is_readonly", False):
+            return False
+        if getattr(tool_def, "deterministic", False):
+            return False
+        try:
+            if bool((arguments or {}).get("no_cache")):
+                return False
+        except AttributeError:
+            return False
+        if getattr(tool_def, "repeatable", False):
+            return bool(getattr(tool_def, "replay_after_compaction", False))
+        return True
+
     def _record_written_target(self, arguments: Mapping[str, Any]) -> None:
         """Remember a file written by write_file/edit_file for completion checks."""
         raw = arguments.get("path") or arguments.get("file_path")
@@ -2956,6 +3174,12 @@ class AgentLoop:
             key for key in lost & self._called_ok if self._is_tool_readonly(key[0])
         }
         self._called_ok.difference_update(reopened)
+        # Every lost call reopens, as before replay existed; the replay budget
+        # only decides, at call time, whether it is restored or run again.
+        self._readonly_replay_protected.difference_update(reopened)
+        self._readonly_replay_ready.update(
+            key for key in reopened if key in self._readonly_replay_cache
+        )
         return sorted({key[0] for key in reopened})
 
     def _identical_call_key(self, tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -3050,16 +3274,32 @@ class AgentLoop:
 
         # Cache successful deterministic results so an identical later call is
         # served without re-execution (regression: repeated financial_rigor
-        # calcs after compaction, 2026-08-20 INTC run).
+        # calcs after compaction, 2026-08-20 INTC run). Readonly results use a
+        # separate run-scoped replay cache: it is only consulted after
+        # compaction has made that exact result unreadable, and only for tools
+        # whose replay policy allows it.
         if success:
             try:
                 tool_def = self.registry.get(tc.name)
             except Exception:  # noqa: BLE001
                 tool_def = None
+            cache_key = self._identical_call_key(tc.name, tc.arguments)
             if tool_def is not None and getattr(tool_def, "deterministic", False):
-                cache_key = self._identical_call_key(tc.name, tc.arguments)
                 if cache_key is not None:
                     self._called_identical[cache_key] = result
+            elif (
+                cache_key is not None
+                and self._readonly_replay_allowed(tool_def, tc.arguments)
+            ):
+                self._readonly_replay_cache[cache_key] = result
+            # Its payload is visible again, so nothing is waiting to be restored.
+            self._readonly_replay_ready.discard(cache_key)
+            # A write can change what a readonly call reads (a factor file, a
+            # config), so no result cached before it may be replayed after it.
+            if update_memory and not self._is_tool_readonly(tc.name):
+                self._readonly_replay_cache.clear()
+                self._readonly_replay_ready.clear()
+                self._readonly_replay_protected.clear()
 
         status = "ok" if success else "error"
         truncated = truncate_tool_result(result)

@@ -128,7 +128,11 @@ _ANALYSIS_KIND_ALIASES = {
     "historical_var": "tail_risk",
     "parametric_var": "tail_risk",
     "cvar": "tail_risk",
+    "cvar_95": "tail_risk",
+    "cvar_99": "tail_risk",
     "es": "tail_risk",
+    "es_95": "tail_risk",
+    "es_99": "tail_risk",
     "expected_shortfall": "tail_risk",
     # Chinese TOOL FIELD NAMES from A-share tools, not answer prose.
     "最大回撤": "drawdown",
@@ -360,6 +364,47 @@ _EXACT_ONLY_ALIASES = frozenset({"var", "es"})
 _QUALIFIER_SUFFIXES = frozenset(
     {"daily", "weekly", "monthly", "annual", "annualized", "yearly", "pct", "percent", "bps"}
 )
+
+
+#: Tail-risk measure per field-name token, scanned right to left like every
+#: other head-noun rule in this module. VaR and ES/CVaR are different
+#: measurements of the same family, and 95% and 99% are different numbers of
+#: either, so the family alone cannot say which value a figure quotes (#1425).
+_TAIL_RISK_MEASURE_TOKENS = {
+    "var": "var",
+    "cvar": "es",
+    "es": "es",
+    "shortfall": "es",
+}
+
+
+def tail_risk_identity(path: str) -> str | None:
+    """The tail-risk identity an evidence field names, e.g. ``var_95``.
+
+    Read off the FIELD NAME a tool returned — never off answer prose, which the
+    gate does not interpret. ``data.tail_risk.var_95`` and ``historical_var``
+    are ``var_95`` and ``var``; ``cvar_99`` and ``es_99`` are both ``es_99``,
+    which is the point: they are the same measurement under two names.
+
+    Args:
+        path: Evidence JSON path or leaf name.
+
+    Returns:
+        ``"<measure>"`` or ``"<measure>_<confidence>"``, or None when the field
+        is not a tail-risk value at all.
+    """
+    if _metric_kind_for_path(path) != "tail_risk":
+        return None
+    tokens = [token for token in re.split(r"[_.]", _leaf_name(path)) if token]
+    confidence = tokens[-1] if tokens and tokens[-1].isdigit() else ""
+    measure = None
+    for token in reversed([token for token in tokens if not token.isdigit()]):
+        measure = _TAIL_RISK_MEASURE_TOKENS.get(token)
+        if measure is not None:
+            break
+    if measure is None:
+        return None
+    return f"{measure}_{confidence}" if confidence else measure
 
 
 def _metric_kind_for_path(path: str) -> str | None:
@@ -661,6 +706,15 @@ class _EvidenceMixin:
                 and symbol_provenance.get("currency_conversion")
                 else None
             )
+            # The currency the source declared for this line wins over the
+            # one its suffix implies: a venue can list lines in more than one
+            # (#1566), and the answer is required to name this one.
+            quote_currency = (
+                str(symbol_provenance.get("quote_currency"))
+                if isinstance(symbol_provenance, dict)
+                and symbol_provenance.get("quote_currency")
+                else _infer_currency(symbol)
+            )
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -682,7 +736,7 @@ class _EvidenceMixin:
                             field=normalized_field,
                             value=value,
                             status="observed",
-                            currency=_infer_currency(symbol),
+                            currency=quote_currency,
                             venue=_infer_venue(symbol),
                             currency_conversion=currency_conversion,
                         )
@@ -722,7 +776,7 @@ class _EvidenceMixin:
             )
         source = str(payload.get("source") or tool_name)
         remaining = _MAX_GENERIC_EVIDENCE
-        timestamp_fields = (*_TIMESTAMP_FIELDS, "as_of")
+        timestamp_fields = (*_TIMESTAMP_FIELDS, "latest_date", "as_of")
 
         def visit(value: Any, path: str, timestamp: str | None = None) -> None:
             nonlocal remaining
